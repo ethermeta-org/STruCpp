@@ -59,7 +59,8 @@ export interface CompileOptions {
    * themselves via `strucpp/node`'s `discoverStlibs(dir)` (or
    * `loadStlibFromFile(path)`) and pass them through here.  Browser
    * consumers fetch archive bytes and parse with
-   * `loadStlibFromBuffer` / `loadStlibFromString`.
+   * `loadStlibFromBuffer` / `loadStlibFromString`, or register them with
+   * `registerInternalStlib`. Product ZIP bytes are not accepted here.
    */
   libraries?: import("./library/library-manifest.js").StlibArchive[];
 

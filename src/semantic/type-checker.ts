@@ -676,13 +676,8 @@ export class TypeChecker {
       return undefined;
     }
 
-    // Check if it's a standard function even without the registry
-    // (the function might be known via the symbol table from library loading)
-    const globalSymbol = this.symbolTables.globalScope.lookup(
-      expr.functionName,
-    );
-    if (globalSymbol?.kind === "functionBlock") {
-      return undefined; // FB invocation, no direct return type
+    if (this.symbolTables.lookupFunctionBlock(expr.functionName)) {
+      return undefined;
     }
 
     // Unknown function — don't error here, the undeclared-variable pass handles this

@@ -96,7 +96,7 @@ strucpp --compile-lib math.st -o libs/ --lib-name math-utils
 strucpp --compile-lib src/mylib/ -o libs/ --lib-name my-lib    # Directory input
 ```
 
-Directories are scanned recursively for `.st` files. Produces a single `<lib-name>.stlib` JSON archive. Library mode uses only explicit `-L` paths (bundled libs are not auto-added to avoid self-referencing).
+Directories are scanned recursively for `.st` files. Produces a single `<lib-name>.stlib` JSON file. That file is the compiler's internal payload (`formatVersion: 1`). It is not a distributable product package. Product packages are ZIP `formatVersion: 2` and are opened only by the UC loader. Library mode uses only explicit `-L` paths (bundled libs are not auto-added to avoid self-referencing).
 
 ### Decompile Library
 
@@ -117,7 +117,7 @@ strucpp --import-lib oscat.lib -o libs/ --lib-name oscat-basic
 strucpp --import-lib project.library -o libs/ --lib-name my-project -L libs/
 ```
 
-Format is auto-detected. Extracts ST source from the binary/ZIP format, compiles it, and produces a `.stlib` archive.
+Format is auto-detected. Extracts ST source from the binary/ZIP format, compiles it, and writes the same internal JSON payload as `--compile-lib`. That file is not a distributable product package. CODESYS `.library` ZIP parsing stays in the importer and is not the product `.stlib` path.
 
 ## Options
 

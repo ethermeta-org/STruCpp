@@ -18,7 +18,7 @@ import { suggestionForParseError } from "./frontend/parser-error-message-provide
 import { buildAST } from "./frontend/ast-builder.js";
 import { transpileILSource } from "./il/il-transpiler.js";
 import { buildProjectModel } from "./project-model.js";
-import { SymbolTables } from "./semantic/symbol-table.js";
+import { DuplicateSymbolError, SymbolTables } from "./semantic/symbol-table.js";
 import { SemanticAnalyzer } from "./semantic/analyzer.js";
 import { CodeGenerator } from "./backend/codegen.js";
 import {
@@ -96,6 +96,21 @@ function validateCompileOptions(options: CompileOptions): void {
  * declared reachable so the test harness sees the full symbol set
  * regardless of what the source AST happens to reference.
  */
+function addLibraryQualifiedName(
+  name: string,
+  referencedNames: Set<string>,
+  symbolByNamespace: Map<string, { library: string; chunk: string }>,
+): boolean {
+  const dot = name.indexOf(".");
+  if (dot <= 0 || name.includes("::")) return false;
+  const key = `${name.slice(0, dot).toUpperCase()}::${name
+    .slice(dot + 1)
+    .toUpperCase()}`;
+  if (!symbolByNamespace.has(key)) return false;
+  referencedNames.add(key);
+  return true;
+}
+
 function collectUsedSymbols(
   ast: CompilationUnit,
   archives: StlibArchive[],
@@ -119,15 +134,23 @@ function collectUsedSymbols(
   // normalises every emitted identifier to uppercase before sealing
   // chunk boundaries).
   const symbolIndex = new Map<string, { library: string; chunk: string }>();
+  // `NS::NAME` must hit the library whose namespace is NS, not whichever
+  // archive registered the bare chunk name last.
+  const symbolByNamespace = new Map<
+    string,
+    { library: string; chunk: string }
+  >();
   // Per-library chunk-name lookup so the dep BFS can resolve chunks
   // it already named when the consumer didn't reference them directly.
   const chunkByKey = new Map<string, { library: string; chunk: string }>();
 
   for (const archive of archives) {
     const libName = archive.manifest.name;
+    const ns = archive.manifest.namespace.toUpperCase();
     for (const chunk of archive.chunks ?? []) {
       const entry = { library: libName, chunk: chunk.name };
       symbolIndex.set(chunk.name.toUpperCase(), entry);
+      symbolByNamespace.set(`${ns}::${chunk.name.toUpperCase()}`, entry);
       chunkByKey.set(`${libName}:${chunk.name}`, entry);
     }
   }
@@ -139,11 +162,18 @@ function collectUsedSymbols(
       case "FunctionCallExpression": {
         const fc = node as FunctionCallExpression;
         referencedNames.add(fc.functionName.toUpperCase());
+        addLibraryQualifiedName(
+          fc.functionName,
+          referencedNames,
+          symbolByNamespace,
+        );
         break;
       }
       case "VariableExpression": {
         // Inline-global reads (e.g. `MATH.PI2`) show up as
-        // VariableExpression with name="MATH".
+        // VariableExpression with name="MATH". A library global
+        // `NS.Name` is rewritten to `NS::Name` before this walk;
+        // that whole token selects the chunk via symbolByNamespace.
         const ve = node as unknown as { name: string };
         referencedNames.add(ve.name.toUpperCase());
         break;
@@ -151,6 +181,16 @@ function collectUsedSymbols(
       case "TypeReference": {
         const tr = node as TypeReference;
         referencedNames.add(tr.name.toUpperCase());
+        const typeDot = tr.name.indexOf(".");
+        if (typeDot > 0) {
+          const bare = tr.name.slice(typeDot + 1);
+          const added = addLibraryQualifiedName(
+            tr.name,
+            referencedNames,
+            symbolByNamespace,
+          );
+          if (!added) referencedNames.add(bare.toUpperCase());
+        }
         if (tr.elementTypeName) {
           referencedNames.add(tr.elementTypeName.toUpperCase());
         }
@@ -183,7 +223,9 @@ function collectUsedSymbols(
   const queue: Array<{ library: string; chunk: string }> = [];
 
   for (const name of referencedNames) {
-    const entry = symbolIndex.get(name);
+    const entry = name.includes("::")
+      ? symbolByNamespace.get(name)
+      : symbolIndex.get(name);
     if (entry) {
       const key = `${entry.library}:${entry.chunk}`;
       if (!reachable.has(key)) {
@@ -595,8 +637,29 @@ function runPipeline(
   let semanticSymbolTables: SymbolTables | undefined;
   if (allArchives.length > 0) {
     semanticSymbolTables = new SymbolTables();
-    for (const archive of allArchives) {
-      registerLibrarySymbols(archive.manifest, semanticSymbolTables);
+    try {
+      for (const archive of allArchives) {
+        registerLibrarySymbols(archive.manifest, semanticSymbolTables);
+      }
+    } catch (e) {
+      if (!(e instanceof DuplicateSymbolError)) {
+        throw e;
+      }
+      errors.push({
+        message: e.message,
+        line: 0,
+        column: 0,
+        severity: "error",
+      });
+      return {
+        ast,
+        projectModel,
+        symbolTables,
+        errors,
+        warnings,
+        allArchives,
+        mergedOptions,
+      };
     }
   }
 
@@ -1085,11 +1148,13 @@ export type { EnclosingScope } from "./ast-utils.js";
 
 // Re-export library system
 export { compileLibrary, compileStlib } from "./library/library-compiler.js";
+export { STLIB_INTERNAL_FORMAT_VERSION } from "./library/library-manifest.js";
 export {
   loadLibraryManifest,
   loadStlibArchive,
   loadStlibFromBuffer,
   loadStlibFromString,
+  registerInternalStlib,
   registerLibrarySymbols,
   LibraryManifestError,
 } from "./library/library-loader.js";

@@ -1566,7 +1566,12 @@ export class ASTBuilder {
     const children = node.children as CstChildren;
 
     const nameToken = getFirstToken(children.Identifier);
-    const name = nameToken?.image ?? "INT";
+    const allIdents = getAllTokens(children.Identifier);
+    const hasDot = !!children.Dot;
+    const name =
+      hasDot && allIdents.length >= 2
+        ? `${allIdents[0]!.image}.${allIdents[1]!.image}`
+        : (nameToken?.image ?? "INT");
     const isRefTo = !!children.REF_TO;
     const isReferenceTo = !!children.REFERENCE_TO;
     const isPointerTo = !!children.POINTER;
@@ -1589,8 +1594,8 @@ export class ASTBuilder {
     } else {
       // Check for identifier-based length (STRING(CONSTANT_NAME))
       // Note: children.Identifier[0] is the type name itself; [1] would be the length constant
-      const allIdents = getAllTokens(children.Identifier);
-      if (allIdents.length > 1) {
+      // A qualified type (MC.MC_Power) also has two identifiers — skip those.
+      if (!hasDot && allIdents.length > 1) {
         maxLength = allIdents[1]!.image;
       }
     }

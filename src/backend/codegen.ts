@@ -46,6 +46,26 @@ import type {
   LibraryChunk,
   StlibArchive,
 } from "../library/library-manifest.js";
+
+/**
+ * C++ nested namespace for a user library, or undefined when the archive
+ * stays flat inside `namespace strucpp` (iec-standard-fb and other builtins).
+ */
+function emittedCppNamespace(ns: string | undefined): string | undefined {
+  if (!ns || ns === "strucpp") return undefined;
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(ns)) return undefined;
+  return ns;
+}
+
+function libraryCppNamespace(archive: StlibArchive): string | undefined {
+  if (archive.manifest.name === "iec-standard-fb") return undefined;
+  /* Product mc is isBuiltin but still lives in namespace MC so MC.MC_Power
+   * codegen matches the qualified type. */
+  const ns = archive.manifest.namespace;
+  if (!ns || ns === "strucpp") return undefined;
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(ns)) return undefined;
+  return ns;
+}
 import {
   collectFileScopeGlobals,
   getProjectNamespace,
@@ -577,6 +597,20 @@ export class CodeGenerator {
     //      returns garbage when nearby variables are forced. Use the
     //      `IEC_<name>` wrapper (= `IEC_ENUM<name>`) so enum-typed fields
     //      have proper IECVar shape with forcing support.
+    if (typeName.includes(".")) {
+      const dot = typeName.indexOf(".");
+      const ns = emittedCppNamespace(typeName.slice(0, dot));
+      const localName = typeName.slice(dot + 1);
+      const emitted = this.enumTypeMembers.has(localName.toUpperCase())
+        ? `IEC_${localName}`
+        : localName;
+      if (
+        this.isUserDefinedType(typeName) ||
+        this.isUserDefinedType(localName)
+      ) {
+        return ns ? `${ns}::${emitted}` : emitted;
+      }
+    }
     if (this.isUserDefinedType(typeName)) {
       // Programs use Program_NAME class naming convention
       if (this.knownProgramTypes.has(typeName.toUpperCase())) {
@@ -774,27 +808,43 @@ export class CodeGenerator {
         referenceKind?: string;
       }>;
     }>,
+    sourceNamespace?: string,
   ): void {
     for (const fb of fbs) {
       const fbUpper = fb.name.toUpperCase();
       this.knownFBTypes.add(fbUpper);
+      if (sourceNamespace) {
+        this.knownFBTypes.add(`${sourceNamespace}.${fb.name}`.toUpperCase());
+      }
       if (fb.inputNames.length > 0) {
-        this.fbInputParams.set(
-          fbUpper,
-          fb.inputNames.map((n) => n.toUpperCase()),
-        );
+        const inputNames = fb.inputNames.map((n) => n.toUpperCase());
+        this.fbInputParams.set(fbUpper, inputNames);
+        if (sourceNamespace) {
+          this.fbInputParams.set(
+            `${sourceNamespace}.${fb.name}`.toUpperCase(),
+            inputNames,
+          );
+        }
       }
       if (fb.inoutNames.length > 0) {
-        this.fbInoutParams.set(
-          fbUpper,
-          new Set(fb.inoutNames.map((n) => n.toUpperCase())),
-        );
+        const inoutSet = new Set(fb.inoutNames.map((n) => n.toUpperCase()));
+        this.fbInoutParams.set(fbUpper, inoutSet);
+        if (sourceNamespace) {
+          this.fbInoutParams.set(
+            `${sourceNamespace}.${fb.name}`.toUpperCase(),
+            inoutSet,
+          );
+        }
       }
       for (const f of fb.fields) {
-        this.libraryFBFieldTypes.set(
-          `${fbUpper}.${f.name.toUpperCase()}`,
-          f.type,
-        );
+        const fieldKey = `${fbUpper}.${f.name.toUpperCase()}`;
+        this.libraryFBFieldTypes.set(fieldKey, f.type);
+        if (sourceNamespace) {
+          this.libraryFBFieldTypes.set(
+            `${sourceNamespace}.${fb.name}.${f.name}`.toUpperCase(),
+            f.type,
+          );
+        }
         // Store array metadata for inline array type reconstruction
         if (f.arrayDimensions || f.elementTypeName || f.referenceKind) {
           const ref: {
@@ -805,10 +855,13 @@ export class CodeGenerator {
           if (f.arrayDimensions) ref.arrayDimensions = f.arrayDimensions;
           if (f.elementTypeName) ref.elementTypeName = f.elementTypeName;
           if (f.referenceKind) ref.referenceKind = f.referenceKind;
-          this.libraryFBFieldTypeRefs.set(
-            `${fbUpper}.${f.name.toUpperCase()}`,
-            ref,
-          );
+          this.libraryFBFieldTypeRefs.set(fieldKey, ref);
+          if (sourceNamespace) {
+            this.libraryFBFieldTypeRefs.set(
+              `${sourceNamespace}.${fb.name}.${f.name}`.toUpperCase(),
+              ref,
+            );
+          }
         }
       }
     }
@@ -820,9 +873,13 @@ export class CodeGenerator {
    */
   private registerLibraryTypes(
     types: Array<{ name: string; kind: string }>,
+    sourceNamespace?: string,
   ): void {
     for (const t of types) {
       const nameUpper = t.name.toUpperCase();
+      if (sourceNamespace) {
+        this.knownStructTypes.add(`${sourceNamespace}.${t.name}`.toUpperCase());
+      }
       if (t.kind === "enum") {
         // Members are not available in the manifest, but we only need to
         // know the type IS an enum for :: emission in generateVariableExpression
@@ -840,6 +897,7 @@ export class CodeGenerator {
    */
   registerLibraryArchives(archives: StlibArchive[]): void {
     for (const archive of archives) {
+      const ns = archive.manifest.namespace;
       this.registerLibraryFBTypes(
         archive.manifest.functionBlocks.map((fb) => {
           const mapVar = (v: {
@@ -875,9 +933,10 @@ export class CodeGenerator {
             ],
           };
         }),
+        ns,
       );
       if (archive.manifest.types) {
-        this.registerLibraryTypes(archive.manifest.types);
+        this.registerLibraryTypes(archive.manifest.types, ns);
       }
     }
   }
@@ -893,6 +952,40 @@ export class CodeGenerator {
    */
   addLibraryChunks(archive: StlibArchive, reachable: Set<string>): void {
     this.libraryEmissions.push({ archive, reachable });
+  }
+
+  /**
+   * `using namespace NS` when none of the emitted names clash; otherwise
+   * `using NS::Name` only for unambiguous symbols.
+   */
+  private emitLibraryUsingDirectives(
+    wrapNs: string,
+    chunks: LibraryChunk[],
+    stream: "header" | "cpp" = "header",
+  ): void {
+    const emitLine =
+      stream === "header"
+        ? (line: string) => this.emitHeader(line)
+        : (line: string) => this.emit(line);
+    const names = chunks.map((chunk) => chunk.name);
+    const clash = (name: string): boolean =>
+      this._symbolTables?.isAmbiguous(name) ?? false;
+    const programOwns = (name: string): boolean => {
+      const fn = this._symbolTables?.lookupFunction(name);
+      const fb = this._symbolTables?.lookupFunctionBlock(name);
+      const sym = fn ?? fb;
+      return !!sym && !sym.sourceNamespace;
+    };
+    const blocked = (name: string): boolean => clash(name) || programOwns(name);
+    if (names.every((name) => !blocked(name))) {
+      emitLine(`using namespace ${wrapNs};`);
+      return;
+    }
+    for (const name of names) {
+      if (!blocked(name)) {
+        emitLine(`using ${wrapNs}::${name};`);
+      }
+    }
   }
 
   /**
@@ -1301,6 +1394,11 @@ export class CodeGenerator {
       if (reachableChunks.length === 0) continue;
 
       this.emitHeader(`// Library: ${archive.manifest.name}`);
+      const wrapNs = libraryCppNamespace(archive);
+
+      if (wrapNs) {
+        this.emitHeader(`namespace ${wrapNs} {`);
+      }
 
       for (const chunk of reachableChunks) {
         if (chunk.kind === "functionBlock") {
@@ -1312,6 +1410,11 @@ export class CodeGenerator {
         for (const line of chunk.header.split("\n")) {
           this.emitHeader(line);
         }
+      }
+
+      if (wrapNs) {
+        this.emitHeader(`}  // namespace ${wrapNs}`);
+        this.emitLibraryUsingDirectives(wrapNs, reachableChunks);
       }
 
       this.emitHeader("");
@@ -1433,10 +1536,18 @@ export class CodeGenerator {
       if (reachableChunks.length === 0) continue;
 
       this.emit(`// Library: ${archive.manifest.name}`);
+      const wrapNs = libraryCppNamespace(archive);
+      if (wrapNs) {
+        this.emit(`namespace ${wrapNs} {`);
+      }
       for (const chunk of reachableChunks) {
         for (const line of chunk.cpp.split("\n")) {
           this.emit(line);
         }
+      }
+      if (wrapNs) {
+        this.emit(`}  // namespace ${wrapNs}`);
+        this.emitLibraryUsingDirectives(wrapNs, reachableChunks, "cpp");
       }
       this.emit("");
     }
@@ -4569,6 +4680,29 @@ export class CodeGenerator {
   ): string {
     // Handle dotted method calls: THIS.method, SUPER.method, instance.method
     if (expr.functionName.includes(".")) {
+      const dotAt = expr.functionName.indexOf(".");
+      const callPrefix = expr.functionName.substring(0, dotAt);
+      const prefixIsInstance = this.currentScopeVarTypes.has(
+        callPrefix.toUpperCase(),
+      );
+      const libFn = prefixIsInstance
+        ? undefined
+        : this.symbolTables.lookupFunction(expr.functionName);
+      const libFb = prefixIsInstance
+        ? undefined
+        : this.symbolTables.lookupFunctionBlock(expr.functionName);
+      const libCall = libFn ?? libFb;
+      if (libCall) {
+        const args = expr.arguments.map((arg) =>
+          this.generateExpression(arg.value),
+        );
+        const ns = emittedCppNamespace(libCall.sourceNamespace);
+        const bare = libCall.name;
+        if (ns) {
+          return `${ns}::${bare}(${args.join(", ")})`;
+        }
+        return `${bare}(${args.join(", ")})`;
+      }
       const dotIdx = expr.functionName.indexOf(".");
       const prefix = expr.functionName.substring(0, dotIdx);
       const methodName = expr.functionName.substring(dotIdx + 1);

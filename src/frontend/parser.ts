@@ -800,6 +800,11 @@ export class STParser extends CstParser {
       ]);
     });
     const typeNameTok = this.CONSUME(tokens.Identifier);
+    // Optional library qualification: MC.MC_Power
+    this.OPTION3(() => {
+      this.CONSUME(tokens.Dot);
+      this.CONSUME2(tokens.Identifier);
+    });
     // Optional parameterized length for STRING(n) / WSTRING(n) / STRING(CONSTANT_NAME)
     // GATE: only when the type name is STRING or WSTRING, consume ( IntegerLiteral ) or ( Identifier )
     // Avoid ( Identifier ) for typed enums and ( IntegerLiteral .. ) for subrange types

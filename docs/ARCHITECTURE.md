@@ -168,14 +168,13 @@ The code generator tracks ST source line -> C++ output line correspondence, stor
 
 ## Library System
 
-Libraries use a single-file `.stlib` archive format (JSON):
+Libraries use a single-file internal JSON archive (`formatVersion: 1`). That file is not a distributable product package. `compile()` accepts the parsed archive only; it does not open a product ZIP.
 
 ```json
 {
   "formatVersion": 1,
   "manifest": { "name": "...", "functions": [...], "functionBlocks": [...], "types": [...] },
-  "headerCode": "// pre-compiled C++ header",
-  "cppCode": "// pre-compiled C++ implementation",
+  "chunks": [{ "name": "...", "kind": "functionBlock", "header": "...", "cpp": "...", "deps": [] }],
   "sources": [{ "fileName": "...", "source": "..." }],
   "dependencies": [],
   "globalConstants": {}
@@ -204,7 +203,7 @@ Five mutually exclusive modes:
 ```
 strucpp input.st -o output.cpp          # Compile ST to C++
 strucpp input.st --build                # Compile + build interactive REPL binary
-strucpp --compile-lib *.st -o dir       # Compile ST library to .stlib
+strucpp --compile-lib *.st -o dir       # Internal JSON payload, not a product package
 strucpp --test test.st source.st        # Run ST test suite against source
 strucpp --decompile-lib lib.stlib -o dir  # Extract ST sources from .stlib
 strucpp --import-lib codesys.lib -o dir   # Convert CODESYS library to .stlib

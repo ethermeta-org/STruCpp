@@ -89,8 +89,10 @@ describe("CLI Library Features", () => {
       ]);
 
       expect(stdout).toContain("Library compilation successful!");
+      // math-lib.stlib is the internal JSON payload, not a distributable product package.
+      expect(stdout).toContain("not a distributable product package");
 
-      // Check .stlib archive exists
+      // Check internal payload exists
       const stlibPath = join(outDir, "math-lib.stlib");
       expect(existsSync(stlibPath)).toBe(true);
 
@@ -687,6 +689,39 @@ describe("CLI Library Features", () => {
         extractDir,
       ]);
       expect(existsSync(join(extractDir, "flat.st"))).toBe(true);
+    });
+  });
+
+  describe("default bundled libraries", () => {
+    it("still resolves TON from iec-standard-fb", () => {
+      const workDir = freshDir("default-ton");
+      const stFile = join(workDir, "ton.st");
+      writeFileSync(stFile, "PROGRAM P VAR t : TON; END_VAR END_PROGRAM\n");
+      const out = join(workDir, "ton.cpp");
+      runCLI([stFile, "-o", out]);
+      expect(existsSync(out)).toBe(true);
+    });
+
+    it("does not take MC_Power from bundled plcopen-softmotion", () => {
+      const workDir = freshDir("default-no-softmotion");
+      const stFile = join(workDir, "power.st");
+      writeFileSync(
+        stFile,
+        "PROGRAM P VAR pwr : MC_Power; END_VAR END_PROGRAM\n",
+      );
+      let text = "";
+      try {
+        execFileSync("node", [CLI_PATH, stFile, "-o", join(workDir, "power.cpp")], {
+          encoding: "utf-8",
+          timeout: 15000,
+        });
+        throw new Error("MC_Power resolved from the default bundled set");
+      } catch (err: unknown) {
+        const e = err as { stdout?: string; stderr?: string; status?: number };
+        if (e.status === undefined || e.status === 0) throw err;
+        text = `${e.stdout ?? ""}\n${e.stderr ?? ""}`;
+      }
+      expect(text).toMatch(/MC_Power/);
     });
   });
 });

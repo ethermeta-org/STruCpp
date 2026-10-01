@@ -17,6 +17,22 @@ import type {
 } from "../frontend/ast.js";
 import { ELEMENTARY_TYPES } from "./type-utils.js";
 
+/**
+ * Split `Namespace.Name` on the first dot. Unqualified names return undefined.
+ */
+function splitLibraryQualifiedName(
+  name: string,
+): { namespace: string; bare: string } | undefined {
+  const dot = name.indexOf(".");
+  if (dot <= 0 || dot === name.length - 1) {
+    return undefined;
+  }
+  return {
+    namespace: name.slice(0, dot),
+    bare: name.slice(dot + 1),
+  };
+}
+
 // =============================================================================
 // Symbol Types
 // =============================================================================
@@ -45,6 +61,12 @@ export interface BaseSymbol {
 
   /** Resolved type (if applicable) */
   type?: IECType;
+
+  /** Library namespace that registered this symbol (`MC`, `OTHER`, …). */
+  sourceNamespace?: string;
+
+  /** Library manifest name that registered this symbol (`mc`, `other`, …). */
+  sourceLibrary?: string;
 }
 
 /**
@@ -178,6 +200,12 @@ export class SymbolNotFoundError extends Error {
 /**
  * Error thrown when a symbol is already defined
  */
+/** One library that exports a bare name involved in a cross-library clash. */
+export interface AmbiguousLibrarySite {
+  namespace: string;
+  libraryName: string;
+}
+
 export class DuplicateSymbolError extends Error {
   constructor(
     public readonly symbolName: string,
@@ -203,8 +231,8 @@ export class Scope {
    * Define a symbol in this scope.
    * @throws DuplicateSymbolError if symbol already exists in this scope
    */
-  define(symbol: AnySymbol): void {
-    const normalizedName = symbol.name.toUpperCase();
+  define(symbol: AnySymbol, storageKey?: string): void {
+    const normalizedName = (storageKey ?? symbol.name).toUpperCase();
     if (this.symbols.has(normalizedName)) {
       throw new DuplicateSymbolError(symbol.name, this.name);
     }
@@ -293,9 +321,62 @@ export class SymbolTables {
   /** Map of "FBNAME.METHODNAME" to their local scopes (parent = FB scope) */
   private methodScopes: Map<string, Scope> = new Map();
 
+  /** Bare names exported by more than one library. Keys are uppercase. */
+  private ambiguousNames: Map<string, AmbiguousLibrarySite[]> = new Map();
+
   constructor() {
     this.globalScope = new Scope("global");
     this.initializeBuiltinTypes();
+  }
+
+  /**
+   * Record that `name` is exported by more than one library.
+   * Subsequent unqualified lookups return undefined.
+   */
+  markAmbiguous(
+    name: string,
+    siteA: AmbiguousLibrarySite,
+    siteB: AmbiguousLibrarySite,
+  ): void {
+    const key = name.toUpperCase();
+    const existing = this.ambiguousNames.get(key) ?? [];
+    const next = [...existing];
+    for (const site of [siteA, siteB]) {
+      if (site.namespace.length === 0) continue;
+      const seen = next.some(
+        (item) => item.namespace.toUpperCase() === site.namespace.toUpperCase(),
+      );
+      if (!seen) next.push(site);
+    }
+    this.ambiguousNames.set(key, next);
+  }
+
+  /** True when an unqualified `name` collides across libraries. */
+  isAmbiguous(name: string): boolean {
+    return this.ambiguousNames.has(name.toUpperCase());
+  }
+
+  /** Namespaces that export `name`, or undefined when it is not ambiguous. */
+  getAmbiguousNamespaces(name: string): string[] | undefined {
+    return this.ambiguousNames
+      .get(name.toUpperCase())
+      ?.map((site) => site.namespace);
+  }
+
+  /**
+   * `'NS.NAME' (library 'lib') or …` for a bare-name clash.
+   * Empty when `name` is not ambiguous.
+   */
+  ambiguousQualifyText(bareName: string): string {
+    const sites = this.ambiguousNames.get(bareName.toUpperCase());
+    if (!sites || sites.length === 0) return "";
+    const upper = bareName.toUpperCase();
+    return sites
+      .map(
+        (site) =>
+          `'${site.namespace.toUpperCase()}.${upper}' (library '${site.libraryName}')`,
+      )
+      .join(" or ");
   }
 
   /**
@@ -414,36 +495,65 @@ export class SymbolTables {
   }
 
   /**
-   * Look up a type by name.
+   * Resolve a bare or `Namespace.Name` lookup for a single symbol kind.
    */
-  lookupType(name: string): TypeSymbol | undefined {
+  private lookupLibrarySymbol<K extends SymbolKind>(
+    name: string,
+    kind: K,
+  ): Extract<AnySymbol, { kind: K }> | undefined {
+    const qualified = splitLibraryQualifiedName(name);
+    if (qualified) {
+      const qualifiedSym = this.globalScope.lookup(
+        `${qualified.namespace}.${qualified.bare}`,
+      );
+      if (qualifiedSym?.kind === kind) {
+        return qualifiedSym as Extract<AnySymbol, { kind: K }>;
+      }
+      const bareSym = this.globalScope.lookup(qualified.bare);
+      if (
+        bareSym?.kind === kind &&
+        bareSym.sourceNamespace?.toUpperCase() ===
+          qualified.namespace.toUpperCase()
+      ) {
+        return bareSym as Extract<AnySymbol, { kind: K }>;
+      }
+      return undefined;
+    }
+    if (this.isAmbiguous(name)) {
+      return undefined;
+    }
     const symbol = this.globalScope.lookup(name);
-    if (symbol?.kind === "type") {
-      return symbol;
+    if (symbol?.kind === kind) {
+      return symbol as Extract<AnySymbol, { kind: K }>;
     }
     return undefined;
+  }
+
+  /**
+   * Look up a type by name.
+   * `name` may be `"MC_POWER"` or `"MC.MC_POWER"` (case-insensitive).
+   * Unqualified clash → undefined (caller emits the diagnostic).
+   */
+  lookupType(name: string): TypeSymbol | undefined {
+    return this.lookupLibrarySymbol(name, "type");
   }
 
   /**
    * Look up a function by name.
+   * `name` may be `"MC_POWER"` or `"MC.MC_POWER"` (case-insensitive).
+   * Unqualified clash → undefined (caller emits the diagnostic).
    */
   lookupFunction(name: string): FunctionSymbol | undefined {
-    const symbol = this.globalScope.lookup(name);
-    if (symbol?.kind === "function") {
-      return symbol;
-    }
-    return undefined;
+    return this.lookupLibrarySymbol(name, "function");
   }
 
   /**
    * Look up a function block by name.
+   * `name` may be `"MC_POWER"` or `"MC.MC_POWER"` (case-insensitive).
+   * Unqualified clash → undefined (caller emits the diagnostic).
    */
   lookupFunctionBlock(name: string): FunctionBlockSymbol | undefined {
-    const symbol = this.globalScope.lookup(name);
-    if (symbol?.kind === "functionBlock") {
-      return symbol;
-    }
-    return undefined;
+    return this.lookupLibrarySymbol(name, "functionBlock");
   }
 
   /**

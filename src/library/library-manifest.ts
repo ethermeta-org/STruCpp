@@ -323,7 +323,17 @@ export interface LibraryCompileResult {
 }
 
 /**
- * Single-file `.stlib` archive format containing metadata + compiled C++ code.
+ * STruCpp internal archive format. Product packages are ZIP formatVersion 2
+ * and are not this value. `compile()` does not open either container.
+ */
+export const STLIB_INTERNAL_FORMAT_VERSION = 1;
+
+/**
+ * Single-file internal JSON archive: metadata plus per-symbol chunks.
+ *
+ * This is not a distributable product package. The UC loader extracts these
+ * bytes from `providers/st/stlib-internal.json` inside a product ZIP and
+ * passes them here. The compiler never opens that ZIP.
  *
  * Emission to a consumer is per-symbol via `chunks` — the codegen
  * tree-shake walks the user's AST and emits only reachable chunks
@@ -333,7 +343,7 @@ export interface LibraryCompileResult {
  */
 export interface StlibArchive {
   /** Format version for forward compatibility */
-  formatVersion: 1;
+  formatVersion: typeof STLIB_INTERNAL_FORMAT_VERSION;
   /** Library metadata (function/FB/type signatures for symbol registration) */
   manifest: LibraryManifest;
   /** Per-symbol chunks. One entry per top-level declaration emitted

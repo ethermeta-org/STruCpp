@@ -13,7 +13,12 @@ import type {
   LibraryVarType,
   StlibArchive,
 } from "./library-manifest.js";
-import type { SymbolTables, VariableSymbol } from "../semantic/symbol-table.js";
+import { STLIB_INTERNAL_FORMAT_VERSION } from "./library-manifest.js";
+import type {
+  AnySymbol,
+  SymbolTables,
+  VariableSymbol,
+} from "../semantic/symbol-table.js";
 import { DuplicateSymbolError } from "../semantic/symbol-table.js";
 import type {
   ElementaryType,
@@ -298,6 +303,85 @@ export function loadLibraryManifest(json: unknown): LibraryManifest {
   return result;
 }
 
+/** Shown when a clashing symbol has no library name stamped on it. */
+const UNKNOWN_LIBRARY_LABEL = "(none)";
+
+/**
+ * Define a library symbol with `sourceNamespace` and `sourceLibrary`.
+ * Same library registered again keeps the first definition.
+ * A different library in another namespace is kept under `NS.NAME` and the
+ * bare name is marked ambiguous. A different library in the same namespace
+ * cannot be qualified apart, so registration fails instead of dropping it.
+ */
+function defineLibrarySymbol(
+  symbolTables: SymbolTables,
+  symbol: AnySymbol,
+  sourceNamespace: string,
+  libraryName: string,
+): void {
+  const stamped = { ...symbol, sourceNamespace, sourceLibrary: libraryName };
+  try {
+    symbolTables.globalScope.define(stamped);
+  } catch (e) {
+    if (!(e instanceof DuplicateSymbolError)) throw e;
+    const existing = symbolTables.globalScope.lookupLocal(symbol.name);
+    const existingNs = existing?.sourceNamespace ?? "";
+    const existingLib = existing?.sourceLibrary ?? "";
+    const sameNs = existingNs.toUpperCase() === sourceNamespace.toUpperCase();
+    const sameLib = existingLib.toUpperCase() === libraryName.toUpperCase();
+    if (existingNs.length === 0) {
+      /* Builtin type or user symbol already owns the bare name. */
+    } else if (sameNs && sameLib) {
+      /* Idempotent re-register of this library. */
+    } else if (!sameNs && sourceNamespace.length > 0) {
+      symbolTables.markAmbiguous(
+        symbol.name,
+        { namespace: existingNs, libraryName: existingLib },
+        { namespace: sourceNamespace, libraryName },
+      );
+    } else {
+      const prior =
+        existingLib.length > 0 ? existingLib : UNKNOWN_LIBRARY_LABEL;
+      throw new DuplicateSymbolError(
+        symbol.name,
+        `namespace ${sourceNamespace} (libraries ${prior} and ${libraryName})`,
+      );
+    }
+  }
+  storeQualifiedLibrarySymbol(
+    symbolTables,
+    stamped,
+    sourceNamespace,
+    libraryName,
+  );
+}
+
+function storeQualifiedLibrarySymbol(
+  symbolTables: SymbolTables,
+  stamped: AnySymbol,
+  sourceNamespace: string,
+  libraryName: string,
+): void {
+  const qualifiedName = `${sourceNamespace}.${stamped.name}`;
+  const existing = symbolTables.globalScope.lookupLocal(qualifiedName);
+  if (!existing) {
+    /* Key is NS.NAME. symbol.name stays the bare C++ identifier so
+     * codegen's `namespace::name` does not become `NS::NS.NAME`. */
+    symbolTables.globalScope.define({ ...stamped }, qualifiedName);
+    return;
+  }
+  const existingLib = existing.sourceLibrary ?? "";
+  const existingNs = existing.sourceNamespace ?? "";
+  const sameLib = existingLib.toUpperCase() === libraryName.toUpperCase();
+  const sameNs = existingNs.toUpperCase() === sourceNamespace.toUpperCase();
+  if (sameLib && sameNs) return;
+  const prior = existingLib.length > 0 ? existingLib : UNKNOWN_LIBRARY_LABEL;
+  throw new DuplicateSymbolError(
+    stamped.name,
+    `namespace ${sourceNamespace} (libraries ${prior} and ${libraryName})`,
+  );
+}
+
 /**
  * Register a library's symbols into the compiler's symbol tables.
  * This makes library functions, FBs, and types available for semantic analysis.
@@ -316,8 +400,9 @@ export function registerLibrarySymbols(
       sizeBits: 0,
     };
 
-    try {
-      symbolTables.globalScope.define({
+    defineLibrarySymbol(
+      symbolTables,
+      {
         name: fn.name,
         kind: "function",
         declaration: {
@@ -345,11 +430,10 @@ export function registerLibrarySymbols(
           if (p.initialValue !== undefined) sym.initialValue = p.initialValue;
           return sym;
         }),
-      });
-    } catch (e) {
-      // Skip duplicate symbol errors (first definition wins), re-throw others
-      if (!(e instanceof DuplicateSymbolError)) throw e;
-    }
+      },
+      manifest.namespace,
+      manifest.name,
+    );
   }
 
   // Register types
@@ -381,8 +465,9 @@ export function registerLibrarySymbols(
             sizeBits: 0,
           } as ElementaryType));
 
-    try {
-      symbolTables.globalScope.define({
+    defineLibrarySymbol(
+      symbolTables,
+      {
         name: t.name,
         kind: "type",
         declaration: {
@@ -402,10 +487,10 @@ export function registerLibrarySymbols(
           definition: buildLibraryTypeDefinition(t),
         },
         resolvedType,
-      });
-    } catch (e) {
-      if (!(e instanceof DuplicateSymbolError)) throw e;
-    }
+      },
+      manifest.namespace,
+      manifest.name,
+    );
   }
 
   // Register function blocks.
@@ -419,8 +504,9 @@ export function registerLibrarySymbols(
   // on; it does not widen what the debugger displays, which stays the
   // interface.
   for (const fb of manifest.functionBlocks) {
-    try {
-      symbolTables.globalScope.define({
+    defineLibrarySymbol(
+      symbolTables,
+      {
         name: fb.name,
         kind: "functionBlock",
         declaration: {
@@ -442,24 +528,25 @@ export function registerLibrarySymbols(
         // surface only, with a warning naming the block.
         locals: (fb.locals ?? []).map((l) => makeVarSymbol(l, "local")),
         libraryName: manifest.name,
-      });
-    } catch (e) {
-      if (!(e instanceof DuplicateSymbolError)) throw e;
-    }
+      },
+      manifest.namespace,
+      manifest.name,
+    );
   }
 
   // Register exported global variables into the shared global scope. Because
-  // every imported library registers into the SAME globalScope (and duplicates
-  // are skipped, first-wins), a program importing several libraries can see all
-  // of their globals together at the same place — globals are additive.
+  // every imported library registers into the SAME globalScope, a program
+  // importing several libraries can see all of their globals together.
+  // Bare-name clashes are recorded so unqualified use is a compile error.
   for (const g of manifest.globals ?? []) {
     const varType: ElementaryType = ELEMENTARY_TYPES[g.type.toUpperCase()] ?? {
       typeKind: "elementary",
       name: g.type,
       sizeBits: 0,
     };
-    try {
-      symbolTables.globalScope.define({
+    defineLibrarySymbol(
+      symbolTables,
+      {
         name: g.name,
         kind: "variable",
         type: varType,
@@ -481,10 +568,10 @@ export function registerLibrarySymbols(
         isExternal: false,
         isGlobal: true,
         isRetain: false,
-      });
-    } catch (e) {
-      if (!(e instanceof DuplicateSymbolError)) throw e;
-    }
+      },
+      manifest.namespace,
+      manifest.name,
+    );
   }
 }
 
@@ -505,9 +592,9 @@ export function loadStlibArchive(json: unknown): StlibArchive {
   const obj = json as Record<string, unknown>;
 
   // Validate formatVersion
-  if (obj.formatVersion !== 1) {
+  if (obj.formatVersion !== STLIB_INTERNAL_FORMAT_VERSION) {
     throw new LibraryManifestError(
-      "Invalid stlib archive: 'formatVersion' must be 1",
+      `Invalid stlib archive: 'formatVersion' must be ${STLIB_INTERNAL_FORMAT_VERSION}`,
     );
   }
 
@@ -540,7 +627,7 @@ export function loadStlibArchive(json: unknown): StlibArchive {
   }
 
   const archive: StlibArchive = {
-    formatVersion: 1,
+    formatVersion: STLIB_INTERNAL_FORMAT_VERSION,
     manifest,
     chunks: obj.chunks as StlibArchive["chunks"],
     dependencies: obj.dependencies as Array<{ name: string; version: string }>,
@@ -627,6 +714,31 @@ export function loadStlibFromBuffer(
   // browser bundler doesn't have to polyfill it.
   const raw = new TextDecoder("utf-8").decode(bytes);
   return loadStlibFromString(raw, sourceLabel);
+}
+
+/**
+ * Register symbols from an internal JSON archive and return its chunks.
+ *
+ * `payload` is a JSON string or an already-parsed object. Both are the
+ * formatVersion 1 archive, never a product ZIP. Bad JSON and a missing
+ * required field throw LibraryManifestError. `compile()` is not involved
+ * and does not grow a ZIP reader for this path.
+ */
+export function registerInternalStlib(
+  payload: string | object,
+  symbolTables: SymbolTables,
+): StlibArchive {
+  if (symbolTables == null) {
+    throw new LibraryManifestError(
+      "registerInternalStlib: symbolTables is required",
+    );
+  }
+  const archive =
+    typeof payload === "string"
+      ? loadStlibFromString(payload)
+      : loadStlibArchive(payload);
+  registerLibrarySymbols(archive.manifest, symbolTables);
+  return archive;
 }
 
 // File-shaped wrappers (`loadStlibFromFile`, `discoverStlibs`,

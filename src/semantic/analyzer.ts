@@ -2326,12 +2326,16 @@ export class SemanticAnalyzer {
       this.checkBitAccess(expr, varTypeMap, ast, expr.subscripts.length > 0);
     }
 
-    // Validate standard function argument counts and ADR l-value requirement
-    if (
-      expr.kind === "FunctionCallExpression" &&
-      !expr.functionName.includes(".")
-    ) {
-      this.checkStdFunctionArgs(expr);
+    if (expr.kind === "FunctionCallExpression") {
+      this.checkFunctionCallResolution(expr);
+      if (!expr.functionName.includes(".")) {
+        this.checkStdFunctionArgs(expr);
+      } else {
+        const fn = this.symbolTables.lookupFunction(expr.functionName);
+        if (fn) {
+          this.checkStdFunctionArgs(expr);
+        }
+      }
     }
 
     // Recurse into sub-expressions
@@ -2414,16 +2418,9 @@ export class SemanticAnalyzer {
       }
     } else {
       // Library or user-defined function (not a built-in registry function).
-      // Every input WITHOUT an initial value is mandatory; inputs WITH one are
-      // optional (the compiler supplies the default). A call that leaves a
-      // mandatory input unsupplied — e.g. a graphical block with an
-      // unconnected required pin, or hand-written ST missing an argument — is
-      // a compile error here, instead of a confusing failure further down
-      // (the C++ compiler for library functions, or silent zero-fill for
-      // user functions). Function-block invocations resolve to a variable,
-      // not a function, so their optional inputs never reach this path.
-      const sym = this.symbolTables.globalScope.lookup(nameUpper);
-      if (sym?.kind === "function") {
+      // Clash-aware lookup — never globalScope.lookup first-wins.
+      const sym = this.symbolTables.lookupFunction(expr.functionName);
+      if (sym) {
         this.checkRequiredFunctionInputs(expr, sym, userArgs);
       }
     }
@@ -3073,13 +3070,42 @@ export class SemanticAnalyzer {
     if (upper.startsWith("__VLA_") || upper.startsWith("__INLINE_ARRAY_")) {
       return true;
     }
-    const sym = this.symbolTables.globalScope.lookup(upper);
-    if (!sym) return false;
     return (
-      sym.kind === "type" ||
-      sym.kind === "functionBlock" ||
-      sym.kind === "program"
+      this.symbolTables.lookupType(name) !== undefined ||
+      this.symbolTables.lookupFunctionBlock(name) !== undefined ||
+      this.symbolTables.lookupProgram(name) !== undefined
     );
+  }
+
+  /**
+   * Bare function/FB calls use the clash graph. Qualified NS.Name always
+   * resolves. Do not use Scope.lookup first-wins.
+   */
+  private reportAmbiguousFunction(
+    name: string,
+    sourceSpan: { startLine: number; startCol: number; file?: string },
+    kindLabel = "function",
+  ): void {
+    const upper = name.toUpperCase();
+    const qualified = this.symbolTables.ambiguousQualifyText(name);
+    this.addError(
+      `Ambiguous ${kindLabel} '${upper}' — qualify as ${qualified}`,
+      sourceSpan.startLine,
+      sourceSpan.startCol,
+      sourceSpan.file,
+    );
+  }
+
+  private checkFunctionCallResolution(expr: FunctionCallExpression): void {
+    const name = expr.functionName;
+    const fn = this.symbolTables.lookupFunction(name);
+    const fb = this.symbolTables.lookupFunctionBlock(name);
+    if (fn || fb) {
+      return;
+    }
+    if (!name.includes(".") && this.symbolTables.isAmbiguous(name)) {
+      this.reportAmbiguousFunction(name, expr.sourceSpan);
+    }
   }
 
   /**
@@ -3094,6 +3120,21 @@ export class SemanticAnalyzer {
 
     // For inline arrays, validate the element type instead
     const nameToCheck = typeRef.elementTypeName ?? typeRef.name;
+
+    if (
+      !nameToCheck.includes(".") &&
+      this.symbolTables.isAmbiguous(nameToCheck)
+    ) {
+      const upper = nameToCheck.toUpperCase();
+      const qualified = this.symbolTables.ambiguousQualifyText(nameToCheck);
+      this.addError(
+        `Ambiguous type '${upper}' — qualify as ${qualified}`,
+        typeRef.sourceSpan.startLine,
+        typeRef.sourceSpan.startCol,
+        typeRef.sourceSpan.file,
+      );
+      return;
+    }
 
     if (!this.isKnownType(nameToCheck)) {
       this.addError(
@@ -3403,6 +3444,35 @@ export class SemanticAnalyzer {
   }
 
   /**
+   * `NS.Name` on a library global is not a member access. Rewrite the
+   * expression to `NS::Name` so existing codegen emits that token.
+   * A declared base (local or instance) keeps real member access.
+   */
+  private rewriteQualifiedLibraryVariable(
+    expr: {
+      name: string;
+      fieldAccess: string[];
+      subscripts: unknown[];
+      accessChain?: unknown[];
+    },
+    scope: Scope,
+  ): boolean {
+    if (expr.fieldAccess.length !== 1 || expr.subscripts.length > 0) {
+      return false;
+    }
+    if (scope.lookup(expr.name)) return false;
+    const qualified = `${expr.name}.${expr.fieldAccess[0]}`;
+    const sym = this.symbolTables.globalScope.lookup(qualified);
+    if (sym?.kind !== "variable" || !sym.sourceNamespace) return false;
+    const dot = sym.name.indexOf(".");
+    const cppName = dot >= 0 ? sym.name.slice(dot + 1) : expr.fieldAccess[0]!;
+    expr.name = `${sym.sourceNamespace}::${cppName}`;
+    expr.fieldAccess = [];
+    expr.accessChain = [];
+    return true;
+  }
+
+  /**
    * Recursively check an expression for undeclared variable usage.
    */
   private checkExpressionForUndeclaredVars(
@@ -3412,6 +3482,7 @@ export class SemanticAnalyzer {
   ): void {
     switch (expr.kind) {
       case "VariableExpression":
+        if (this.rewriteQualifiedLibraryVariable(expr, scope)) break;
         this.checkNameDeclared(expr.name, scope, ctx, expr.sourceSpan);
         // Reject member access on a type-level symbol (FB / program / type).
         // Resolves the bug where `RED_YELLOW_GREEN.GREENTIME := …` is
@@ -3440,13 +3511,21 @@ export class SemanticAnalyzer {
         }
         break;
       case "FunctionCallExpression":
-        // For dotted names (fb.method), check only the object part
+        this.checkFunctionCallResolution(expr);
+        // Qualified library call (MC.ClashFn) is not an instance method.
         if (expr.functionName.includes(".")) {
           const objName = expr.functionName.substring(
             0,
             expr.functionName.indexOf("."),
           );
-          this.checkNameDeclared(objName, scope, ctx, expr.sourceSpan);
+          const local = scope.lookup(objName);
+          const libFn = this.symbolTables.lookupFunction(expr.functionName);
+          const libFb = this.symbolTables.lookupFunctionBlock(
+            expr.functionName,
+          );
+          if (local?.kind === "variable" || (!libFn && !libFb)) {
+            this.checkNameDeclared(objName, scope, ctx, expr.sourceSpan);
+          }
         }
         // An FB instance reached through an expression (`units[0]()`) — check
         // the instance and its subscripts, which are ordinary variables.
@@ -3560,7 +3639,21 @@ export class SemanticAnalyzer {
     //    enumValue match short-circuit here would swallow the
     //    "Ambiguous enum member" diagnostic.
     const scopeHit = scope.lookup(upper);
-    if (scopeHit && scopeHit.kind !== "enumValue") return;
+    if (scopeHit && scopeHit.kind !== "enumValue") {
+      const globalHit = this.symbolTables.globalScope.lookupLocal(upper);
+      if (
+        scopeHit === globalHit &&
+        (scopeHit.kind === "function" ||
+          scopeHit.kind === "functionBlock" ||
+          scopeHit.kind === "variable") &&
+        this.symbolTables.isAmbiguous(name)
+      ) {
+        const kindLabel =
+          scopeHit.kind === "variable" ? "variable" : "function";
+        this.reportAmbiguousFunction(name, sourceSpan, kindLabel);
+      }
+      return;
+    }
 
     // 1b. Inherited FB member variables (walk EXTENDS chain)
     if (ctx.fbName) {
@@ -3805,10 +3898,14 @@ export class SemanticAnalyzer {
    * Validate MOCK_FUNCTION target exists in global scope or std function registry.
    */
   private validateMockFunction(stmt: MockFunctionStatement): void {
-    const name = stmt.functionName.toUpperCase();
-    const inGlobal = this.symbolTables.globalScope.lookup(name);
+    const name = stmt.functionName;
+    if (!name.includes(".") && this.symbolTables.isAmbiguous(name)) {
+      this.reportAmbiguousFunction(name, stmt.sourceSpan);
+      return;
+    }
+    const inLib = this.symbolTables.lookupFunction(name);
     const inStd = this.stdRegistry.isStandardFunction(name);
-    if (!inGlobal && !inStd) {
+    if (!inLib && !inStd) {
       this.addWarning(
         `Unknown function '${stmt.functionName}' in MOCK_FUNCTION statement`,
         stmt.sourceSpan.startLine,
