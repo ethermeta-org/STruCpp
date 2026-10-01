@@ -1,159 +1,44 @@
-# Library Namespace Support — Design Document
+# Library Namespace Support
 
-## Status: Not Implemented
+Library namespaces follow CODESYS: a bare name resolves when it is unique,
+`Namespace.Name` always resolves, and a cross-library bare name is a compile
+error that names both namespaces and both library names. This is Option A
+from the original design (one C++ namespace per library, `using namespace`
+only when nothing in that library clashes).
 
-Library namespaces are declared in manifests (`LibraryManifest.namespace`) but not
-functionally used. This document describes the current gaps, the target CODESYS
-behavior, and the architectural changes required.
+## Implemented
 
-## Current Behavior
+| Behavior | Where |
+|---|---|
+| Each library symbol is stamped `sourceNamespace` and `sourceLibrary` | `src/library/library-loader.ts` `defineLibrarySymbol` |
+| Bare lookup fails when the name is ambiguous; `NS.NAME` still resolves | `src/semantic/symbol-table.ts` `lookupLibrarySymbol` |
+| Diagnostic lists both sides: `'MC.MC_POWER' (library 'mc') or 'OTHER.MC_POWER' (library 'other')` | `src/semantic/symbol-table.ts` `ambiguousQualifyText`; `src/semantic/analyzer.ts` (`Ambiguous function` / `Ambiguous type` / `Ambiguous variable`) |
+| Same library registered again keeps the first definition | `defineLibrarySymbol` (same namespace and same library name) |
+| Different library, same namespace: registration throws `DuplicateSymbolError` (qualification cannot tell them apart) | `defineLibrarySymbol` |
+| Builtin elementary names (`TIME`, …) stay owned by the compiler. A library symbol with the same bare name is not a clash | `defineLibrarySymbol` when the existing symbol has no `sourceNamespace` |
+| C++ `namespace NS { … }` plus `using namespace NS` when no emitted name clashes; otherwise `using NS::Name` only for the unambiguous names | `src/backend/codegen.ts` `libraryCppNamespace`, the header and cpp wraps that call it, `emitLibraryUsingDirectives` |
 
-- Library C++ code is stripped of its namespace wrapper (`extractNamespaceBody()`)
-  and injected directly into the consumer's `strucpp` namespace.
-- All library symbols are registered into a flat global scope with no namespace
-  tracking. The `manifest.namespace` field is never read during symbol
-  registration or code generation.
-- When two libraries export the same symbol name (e.g., both define a FB called
-  `INIT`), the second registration is **silently dropped** — first-loaded wins,
-  no warning, no error.
-- User code cannot write `LibName.TypeName` to disambiguate library types.
+Product libraries:
 
-## CODESYS Target Behavior
+| Library | `library.json` `namespace` | C++ namespace |
+|---|---|---|
+| `mc` | `MC` (`runtime/plc/libs/mc/library.json`) | `MC`, including when `isBuiltin` is set. `libraryCppNamespace` does not treat `isBuiltin` as flat |
+| `ethercat` | `ETC` (`runtime/plc/libs/ethercat/library.json`) | `ETC` |
+| `iec-stdlib` | `strucpp` (`src/library/builtin-stdlib.ts`) | flat, inside `namespace strucpp` |
+| `iec-standard-fb` | whatever the manifest says | flat. `libraryCppNamespace` returns on that library name before it reads `namespace` |
 
-In CODESYS, every library has a namespace (e.g., `OSCAT_BASIC`, `Standard`):
+The C ABI the runtime `dlsym`s is not inside those namespaces. `strucpp_get_config` and `strucpp_advance_time` are `extern "C"` in `runtime/plc/strucpp/runtime_v4_entry.cpp`. `strucpp_debug_read` / `strucpp_debug_write` are `extern "C"` in `src/runtime/include/debug_dispatch.hpp` under `STRUCPP_V4_DEBUG_EXPORTS_DEFINE`. `runtime/plc/tests/check_ns_so_symbols.sh` runs `nm -D --defined-only` on `libplc_strucpp.so` after a compile that emitted `namespace MC`.
 
-1. **Unqualified access** works when the name is unambiguous across all loaded
-   libraries. `VAR t : TON; END_VAR` resolves if only one library defines `TON`.
+## Limits
 
-2. **Qualified access** always works using dot notation:
-   `VAR t : Standard.TON; END_VAR`.
+- `iec-stdlib` and `iec-standard-fb` stay flat. They are not moved into a user namespace.
+- A namespace that is empty, `strucpp`, or not a C identifier is not wrapped.
+- Two libraries that pick the same namespace and the same symbol fail at registration, including when a builtin already owns the bare name (`TIME`). The ST diagnostic path is only for different namespaces.
+- A bare library global that clashes is `Ambiguous variable`, listing both namespaces and both library names. In a statement, `NS.Name` is rewritten to `NS::Name` (`analyzer.ts` `rewriteQualifiedLibraryVariable`) and tree-shake selects that library's chunk. A declared instance wins over a library symbol with the same spelling (`pwr.Method` stays a method call). Flat libraries (`strucpp`, `iec-standard-fb`) emit a bare C++ name for a qualified ST type. `VAR` initializers are not rewritten. `EXTENDS` / `IMPLEMENTS` still take a single identifier. Same-namespace registration throws `DuplicateSymbolError`, which `compile()` reports as a compile error.
+- Studio does not surface the clash text. That stays in studio-v2.
+- The product `.stlib` ZIP layout is unchanged.
+- Library function blocks are not renamed to avoid a clash.
 
-3. **Collision** — If two libraries export the same name, bare usage is an error.
-   The compiler requires qualification: `LibA.INIT` or `LibB.INIT`.
+## Tests
 
-This mirrors the bare-enum resolution pattern already implemented in
-`buildEnumMemberMap()` (see `src/semantic/type-utils.ts`).
-
-## Affected Subsystems
-
-### 1. Symbol Table (`src/semantic/symbol-table.ts`)
-
-Symbols need a `sourceNamespace?: string` field so the system knows which library
-a function/FB/type came from. Lookup methods must support namespace-qualified
-queries (e.g., `lookupFunction("Standard.TON")`).
-
-### 2. Library Loader (`src/library/library-loader.ts`)
-
-`registerLibrarySymbols()` currently catches `DuplicateSymbolError` and silently
-skips. It must instead:
-
-- Store the namespace on each registered symbol.
-- Detect cross-library collisions and mark them as ambiguous.
-- Emit a warning listing the conflicting libraries.
-
-A reverse map (symbol name -> library namespace) similar to `buildEnumMemberMap`
-would enable ambiguity detection and qualified resolution.
-
-### 3. Parser (`src/frontend/parser.ts`)
-
-Type references must support `Namespace.TypeName` syntax. The parser already
-handles `EnumType.Member` dot notation in variables/expressions. Type references
-in `VAR` declarations would need the same treatment — the `dataType` rule must
-accept `Identifier.Identifier` as a qualified type name.
-
-### 4. Semantic Analyzer (`src/semantic/analyzer.ts`)
-
-- Resolve qualified type names by splitting on `.` and looking up the namespace.
-- For unqualified names that are ambiguous, emit:
-  `"Ambiguous type 'INIT' — qualify as 'LibA.INIT' or 'LibB.INIT'"`.
-- Undeclared-variable checks must also recognize qualified library references.
-
-### 5. Code Generator (`src/backend/codegen.ts`)
-
-**Option A — Namespace wrapping (recommended):**
-
-Wrap each library's preamble code in its own C++ namespace:
-
-```cpp
-namespace strucpp {
-
-namespace iec_standard_fb {
-  // IEC standard FB library code
-  class TON { ... };
-}
-using namespace iec_standard_fb;  // make available unqualified
-
-namespace oscat_basic {
-  // OSCAT library code
-  class AIN1 { ... };
-}
-using namespace oscat_basic;
-
-// User program code
-class MAIN { ... };
-
-}  // namespace strucpp
-```
-
-This preserves unqualified access (via `using namespace`) while enabling
-qualified access (`iec_standard_fb::TON`) when disambiguation is needed.
-
-For collisions, the `using namespace` declarations would be omitted for
-the conflicting names, forcing qualified access in the generated C++.
-
-**Option B — Flat namespace with qualified codegen:**
-
-Keep injecting into `strucpp` but mangle names: `iec_standard_fb__TON`.
-Less clean but avoids nested namespaces.
-
-### 6. Library Utilities (`src/library/library-utils.ts`)
-
-`extractNamespaceBody()` currently discards the namespace name. It should either:
-
-- Preserve the namespace name as a return value alongside the body.
-- Or stop stripping the namespace entirely, letting the injection point
-  handle wrapping.
-
-### 7. Library Compiler (`src/library/library-compiler.ts`)
-
-The `.stlib` archive already stores `manifest.namespace`. No format changes
-needed. The compiler just needs to ensure the namespace is consistently set
-and used.
-
-## Implementation Strategy
-
-The enum qualification system (`buildEnumMemberMap` + ambiguity detection +
-codegen qualification) provides a proven pattern. The library namespace system
-should follow the same architecture:
-
-1. **Build a reverse map** at library load time: `symbolName -> { namespace, isAmbiguous }`.
-2. **Ambiguity detection** in the semantic analyzer using the reverse map.
-3. **Qualified codegen** emitting `namespace::Name` for library symbols.
-4. **Parser support** for `Namespace.TypeName` in type references.
-
-## Related Files
-
-| File | Role |
-|------|------|
-| `src/library/library-manifest.ts` | `LibraryManifest.namespace` field (exists, unused) |
-| `src/library/library-loader.ts` | `registerLibrarySymbols()` — silent duplicate drop |
-| `src/library/library-utils.ts` | `extractNamespaceBody()` — strips namespace |
-| `src/library/library-compiler.ts` | `compileStlib()` — sets namespace in manifest |
-| `src/semantic/symbol-table.ts` | Symbol definitions — no namespace field |
-| `src/semantic/analyzer.ts` | Undeclared-variable checks — no namespace awareness |
-| `src/backend/codegen.ts` | `addLibraryPreamble()` — no namespace wrapping |
-| `src/semantic/type-utils.ts` | `buildEnumMemberMap()` — pattern to reuse |
-
-## Priority
-
-Medium-high. Currently not blocking because:
-
-- The IEC standard FB library uses namespace `strucpp` (same as consumer).
-- OSCAT is the only third-party library and has no symbol collisions with the
-  standard library.
-
-Becomes critical when:
-
-- Users start creating custom libraries with overlapping names.
-- Multiple third-party libraries are loaded simultaneously.
-- CODESYS compatibility requires qualified type references.
+`tests/library/library-namespaces.test.ts` covers bare unique use, `MC.MC_Power` and `OTHER.MC_Power` after a clash, the clash diagnostic (both namespaces and both library names), qualified lookup kept on a second register, same-library re-register, same-namespace rejection, `using namespace` vs a blanket using omitted on clash, and the `iec-standard-fb` flat exception.

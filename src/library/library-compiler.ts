@@ -13,7 +13,10 @@ import type {
   StlibArchive,
 } from "./library-manifest.js";
 import { transpileILSource } from "../il/il-transpiler.js";
-import { HEADER_NAME_RE } from "./library-manifest.js";
+import {
+  HEADER_NAME_RE,
+  STLIB_INTERNAL_FORMAT_VERSION,
+} from "./library-manifest.js";
 import { compile } from "../index.js";
 import { buildChunks } from "./library-chunks.js";
 import { functionBlockLookup } from "../semantic/fb-lineage.js";
@@ -1025,7 +1028,7 @@ export function compileStlib(
     return {
       success: false,
       archive: {
-        formatVersion: 1,
+        formatVersion: STLIB_INTERNAL_FORMAT_VERSION,
         manifest: libResult.manifest,
         chunks: [],
         dependencies: [],
@@ -1046,7 +1049,7 @@ export function compileStlib(
   // needed: a chunk only emits its own declaration text, never a
   // dependency's, by construction.
   const archive: StlibCompileResult["archive"] = {
-    formatVersion: 1,
+    formatVersion: STLIB_INTERNAL_FORMAT_VERSION,
     manifest,
     chunks: libResult.chunks ?? [],
     dependencies: (options.dependencies ?? []).map((d) => ({

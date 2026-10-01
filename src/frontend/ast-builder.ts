@@ -1661,7 +1661,13 @@ export class ASTBuilder {
   buildTypeReference(node: CstNode): TypeReference {
     const children = node.children as CstChildren;
 
-    const name = dataTypeName(node) ?? "INT";
+    const baseName = dataTypeName(node) ?? "INT";
+    const identTokens = getAllTokens(children.Identifier);
+    const hasDot = !!children.Dot;
+    const name =
+      hasDot && identTokens[0] !== undefined
+        ? `${baseName}.${identTokens[0].image}`
+        : baseName;
 
     // The prefixes in source order: CST children are grouped by token type,
     // so their relative order comes from the offsets.
@@ -1689,7 +1695,7 @@ export class ASTBuilder {
     if (lengthToken) {
       maxLength = parseInt(lengthToken.image, 10);
     } else {
-      const lengthName = getFirstToken(children.Identifier);
+      const lengthName = hasDot ? identTokens[1] : identTokens[0];
       if (lengthName) maxLength = lengthName.image;
     }
 

@@ -21,9 +21,11 @@ import {
   loadStlibArchive,
   loadStlibFromString,
   loadStlibFromBuffer,
+  registerInternalStlib,
   registerLibrarySymbols,
   LibraryManifestError,
 } from "../../src/library/library-loader.js";
+import { STLIB_INTERNAL_FORMAT_VERSION } from "../../src/library/library-manifest.js";
 import {
   loadLibraryFromFile,
   discoverLibraries,
@@ -1443,5 +1445,71 @@ describe("Library System", () => {
       expect(result.headerCode).toContain("Library: unreferenced-lib");
       expect(result.cppCode).toContain("Library: unreferenced-lib");
     });
+  });
+});
+
+/**
+ * Internal JSON payload. This test does not open a product ZIP.
+ * The same bytes are embedded by runtime/plc/tests/unit/test_stlib.c.
+ */
+const INTERNAL_ST_PAYLOAD =
+  '{"chunks":[{"cpp":"","deps":[],"header":"","kind":"functionBlock","name":"MC_POWER"}],"dependencies":[],"formatVersion":1,"manifest":{"functionBlocks":[{"inouts":[{"name":"Axis","type":"AXIS_REF"}],"inputs":[{"name":"Enable","type":"BOOL"}],"name":"MC_Power","outputs":[{"name":"Status","type":"BOOL"}]}],"functions":[],"headers":[],"isBuiltin":true,"name":"mc","namespace":"MC","types":[],"version":"1.0.0"}}';
+
+describe("registerInternalStlib", () => {
+  it("registers the FB and returns its chunk from a JSON string", () => {
+    const symbolTables = new SymbolTables();
+    const archive = registerInternalStlib(INTERNAL_ST_PAYLOAD, symbolTables);
+    const fb = symbolTables.globalScope.lookup("MC_Power");
+
+    expect(archive.formatVersion).toBe(STLIB_INTERNAL_FORMAT_VERSION);
+    expect(fb).toBeDefined();
+    expect(fb!.kind).toBe("functionBlock");
+    expect(archive.chunks).toHaveLength(1);
+    expect(archive.chunks[0]!.name).toBe("MC_POWER");
+  });
+
+  it("accepts an already-parsed object", () => {
+    const symbolTables = new SymbolTables();
+    const archive = registerInternalStlib(
+      JSON.parse(INTERNAL_ST_PAYLOAD) as object,
+      symbolTables,
+    );
+
+    expect(symbolTables.globalScope.lookup("MC_Power")?.kind).toBe(
+      "functionBlock",
+    );
+    expect(archive.chunks[0]!.kind).toBe("functionBlock");
+  });
+
+  it("rejects bad JSON", () => {
+    expect(() =>
+      registerInternalStlib("{", new SymbolTables()),
+    ).toThrow(LibraryManifestError);
+  });
+
+  it("rejects formatVersion 2", () => {
+    const parsed = JSON.parse(INTERNAL_ST_PAYLOAD) as { formatVersion: number };
+    parsed.formatVersion = 2;
+    expect(() => registerInternalStlib(parsed, new SymbolTables())).toThrow(
+      "'formatVersion' must be 1",
+    );
+  });
+
+  it("rejects a missing manifest", () => {
+    expect(() =>
+      registerInternalStlib(
+        { formatVersion: STLIB_INTERNAL_FORMAT_VERSION, chunks: [], dependencies: [] },
+        new SymbolTables(),
+      ),
+    ).toThrow("'manifest' must be an object");
+  });
+
+  it("rejects a missing symbol table", () => {
+    expect(() =>
+      registerInternalStlib(
+        INTERNAL_ST_PAYLOAD,
+        null as unknown as SymbolTables,
+      ),
+    ).toThrow("symbolTables is required");
   });
 });

@@ -20,7 +20,7 @@
  *   --cc <path>               Custom C compiler path (default: cc)
  *   --cxx-flags <flags>       Extra C++ compiler flags
  *   -L, --lib-path <path>     Library search path (repeatable)
- *   --compile-lib             Compile sources into a library
+ *   --compile-lib             Compile sources into an internal JSON payload
  *   --lib-name <name>         Library name (required with --compile-lib)
  *   --lib-version <version>   Library version (default: "1.0.0")
  *   --lib-namespace <ns>      C++ namespace (default: derived from lib-name)
@@ -313,12 +313,15 @@ Options:
   --cxx-flags <flags>       Extra C++ compiler flags
   -L, --lib-path <path>     Library search path (repeatable)
   --no-default-libs         Do not auto-add bundled library paths
+                        Bundled plcopen-softmotion is omitted from that
+                        default set. Pass -L to a directory that contains
+                        only that archive to load it.
   -D, --define NAME=VALUE   Define a global constant (repeatable)
   -v, --version             Show version
   -h, --help                Show this help
 
 Library compilation:
-  --compile-lib             Compile sources into a .stlib library archive
+  --compile-lib             Compile sources into an internal JSON payload (not a distributable product package)
   --lib-name <name>         Library name (required with --compile-lib)
   --lib-version <version>   Library version (default: "1.0.0")
   --lib-namespace <ns>      C++ namespace (default: derived from lib-name)
@@ -459,7 +462,30 @@ function getEffectiveLibraryPaths(options: CLIOptions): string[] {
 }
 
 /**
- * Library compilation mode: compile ST sources into a single .stlib archive.
+ * Bundled archive that stays off the default path.
+ * Product library `mc` owns bare `MC_*`. This archive's `MC_Power` uses
+ * `AXIS_REF_SM3` and is not that contract. `discoverStlibs` still returns
+ * it; only the bundled directory used as a default search path drops it.
+ * An explicit `-L` of a different directory still loads it.
+ */
+const BUNDLED_LIB_NOT_DEFAULT = "plcopen-softmotion";
+
+function loadLibrariesForCompile(paths: string[]) {
+  const bundled = findBundledLibsDir();
+  const bundledResolved = bundled === null ? "" : resolve(bundled);
+  return paths.flatMap((libraryPath) => {
+    const archives = discoverStlibs(libraryPath);
+    if (resolve(libraryPath) !== bundledResolved) {
+      return archives;
+    }
+    return archives.filter(
+      (archive) => archive.manifest.name !== BUNDLED_LIB_NOT_DEFAULT,
+    );
+  });
+}
+
+/**
+ * Library compilation mode: write an internal JSON payload, not a product package.
  */
 function compileLibraryMode(options: CLIOptions): void {
   if (!options.libName) {
@@ -581,10 +607,12 @@ function compileLibraryMode(options: CLIOptions): void {
     process.exit(1);
   }
 
-  // Write single .stlib archive
+  // Internal JSON payload. Not a distributable product package (ZIP v2).
   const stlibPath = resolve(outputDir, `${options.libName}.stlib`);
   writeFileSync(stlibPath, JSON.stringify(result.archive, null, 2), "utf-8");
-  console.log(`Library archive written to ${stlibPath}`);
+  console.log(
+    `Internal payload written to ${stlibPath} (not a distributable product package)`,
+  );
   console.log("Library compilation successful!");
 }
 
@@ -635,9 +663,7 @@ function runTestMode(options: CLIOptions): void {
     compileOptions.additionalSources = additionalSources;
   }
   if (effectiveLibPaths.length > 0) {
-    compileOptions.libraries = effectiveLibPaths.flatMap((p) =>
-      discoverStlibs(p),
-    );
+    compileOptions.libraries = loadLibrariesForCompile(effectiveLibPaths);
   }
   if (Object.keys(options.defines).length > 0) {
     compileOptions.globalConstants = options.defines;
@@ -952,7 +978,9 @@ async function importLibMode(options: CLIOptions): Promise<void> {
 
   const stlibPath = resolve(outputDir, `${options.libName}.stlib`);
   writeFileSync(stlibPath, JSON.stringify(result.archive, null, 2), "utf-8");
-  console.log(`\nLibrary archive written to ${stlibPath}`);
+  console.log(
+    `\nInternal payload written to ${stlibPath} (not a distributable product package)`,
+  );
   console.log("Import successful!");
 }
 
@@ -1046,9 +1074,7 @@ async function main(): Promise<void> {
     compileOptions.additionalSources = additionalSources;
   }
   if (effectiveLibPaths.length > 0) {
-    compileOptions.libraries = effectiveLibPaths.flatMap((p) =>
-      discoverStlibs(p),
-    );
+    compileOptions.libraries = loadLibrariesForCompile(effectiveLibPaths);
   }
   if (Object.keys(options.defines).length > 0) {
     compileOptions.globalConstants = options.defines;
@@ -1083,6 +1109,11 @@ async function main(): Promise<void> {
       const headerPath = outputPath.replace(/\.cpp$/i, ".hpp");
       writeFileSync(headerPath, result.headerCode, "utf-8");
       console.log(`Header written to ${headerPath}`);
+    }
+    if (result.debugTableCpp) {
+      const debugPath = join(dirname(outputPath), "generated_debug.cpp");
+      writeFileSync(debugPath, result.debugTableCpp, "utf-8");
+      console.log(`Debug table written to ${debugPath}`);
     }
   } catch {
     console.error(`Error: Cannot write output file: ${outputPath}`);
