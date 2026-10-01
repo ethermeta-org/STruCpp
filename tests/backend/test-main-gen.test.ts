@@ -927,4 +927,12 @@ describe("declaration initializers in a TEST var block", () => {
     );
     expect(code).toContain("IEC_INT K = 5;");
   });
+
+  it("emits SETUP declaration initializers on the struct member", () => {
+    const code = generateFor(
+      PROGRAM,
+      `SETUP\nVAR\n  line_second : INT := 2;\nEND_VAR\nEND_SETUP\nTEST 'local'\n  ASSERT_EQ(line_second, 2);\nEND_TEST\n`,
+    );
+    expect(code).toContain("IEC_INT LINE_SECOND = 2;");
+  });
 });

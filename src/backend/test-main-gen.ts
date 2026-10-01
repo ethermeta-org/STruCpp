@@ -398,7 +398,17 @@ class TestFunctionGenerator {
       for (const decl of varBlock.declarations) {
         const cppType = this.testCodegen.resolveType(decl.type);
         for (const name of decl.names) {
-          lines.push(`    ${cppType} ${name};`);
+          if (decl.initialValue) {
+            lines.push(
+              `    ${cppType} ${name} = ${this.testCodegen.emitInitializer(
+                decl.initialValue,
+                cppType,
+                decl.type.name,
+              )};`,
+            );
+          } else {
+            lines.push(`    ${cppType} ${name};`);
+          }
         }
       }
     }
