@@ -858,6 +858,13 @@ export class SemanticAnalyzer {
     // Validate that integer literals fit an IEC integer type
     this.validateIntegerLiteralRange(ast);
 
+    // One program instance, one task. A duplicated name is one object on two
+    // tasks and the generated C++ member is ill-formed.
+    this.validateProgramInstanceSingleTask(ast);
+
+    // MC_* / ETC_* storage is a mailbox writer. One instance, one program, one task.
+    this.validateMotionFbSingleTask(ast);
+
     // TODO: Implement additional semantic validation
     // - Check CASE statement coverage
     // - Validate reference operations
@@ -3952,6 +3959,656 @@ export class SemanticAnalyzer {
       ...(file ? { file } : {}),
     });
   }
+
+  /** Reject one PROGRAM instance name bound to more than one task. */
+  private validateProgramInstanceSingleTask(ast: CompilationUnit): void {
+    const seen = new Map<string, string>();
+    for (const config of ast.configurations) {
+      for (const resource of config.resources) {
+        for (const inst of resource.programInstances) {
+          const key = `${upperName(config.name)}.${upperName(inst.instanceName)}`;
+          const task = inst.taskName ?? "";
+          const prev = seen.get(key);
+          if (prev !== undefined) {
+            this.addError(
+              `Program instance '${inst.instanceName}' is bound more than once ('${prev}' and '${task}'); one instance may run on only one PLC task`,
+              inst.sourceSpan.startLine,
+              inst.sourceSpan.startCol,
+              inst.sourceSpan.file,
+            );
+          } else {
+            seen.set(key, task);
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * A global MC_* / ETC_* instance (or a user FB that holds one) may be used
+   * from only one PROGRAM and only one PLC task. Two tasks would both write
+   * the same mailbox slot.
+   */
+  private validateMotionFbSingleTask(ast: CompilationUnit): void {
+    const fbs = indexFunctionBlocks(ast);
+    const types = indexNamedTypes(ast);
+    const globals = collectGlobalFbDecls(ast);
+    const refs = motionGlobalPouRefs(ast, globals);
+    const instances = listProgramInstances(ast);
+    for (const [key, global] of globals) {
+      if (
+        !typeHoldsMotionFb(
+          global.typeName,
+          global.elementTypeName,
+          fbs,
+          types,
+          this.symbolTables,
+          new Set<string>(),
+        )
+      ) {
+        continue;
+      }
+      const touching = refs.get(key) ?? [];
+      if (touching.length === 0) {
+        continue;
+      }
+      const programs = programsTouchingMotionGlobal(ast, fbs, touching);
+      const bound = instances.filter((inst) => programs.has(inst.typeName));
+      const tasks = new Set<string>();
+      for (const inst of bound) {
+        if (inst.task !== "") {
+          tasks.add(inst.task);
+        }
+      }
+      const functionTouch = touching.some((item) => item.id.startsWith(POU_FN));
+      const multi = bound.length > 1 || tasks.size > 1;
+      const fnMulti = functionTouch && instances.length > 1;
+      if (!multi && !fnMulti) {
+        continue;
+      }
+      const span =
+        bound.length > 0 ? bound[bound.length - 1]!.span : global.span;
+      const taskList = tasks.size > 0 ? [...tasks].join(", ") : "(none)";
+      const programList = [...programs].join(", ");
+      this.addError(
+        `Motion FB instance '${global.display}' (${global.typeName}) is used from programs ${programList} / tasks ${taskList}; an MC_*, ETC_*, or SMC_* instance may be called from only one PROGRAM and one PLC task`,
+        span.startLine,
+        span.startCol,
+        span.file,
+      );
+    }
+  }
+}
+
+/** Library motion FB type-name prefixes. Instances of these write a mailbox slot. */
+const MOTION_FB_TYPE_PREFIXES: readonly string[] = ["MC_", "ETC_", "SMC_"];
+
+/** Reference pins. The instance does not own that FB's mailbox. */
+const MOTION_STORAGE_SKIP: ReadonlySet<string> = new Set([
+  "VAR_TEMP",
+  "VAR_EXTERNAL",
+  "VAR_INPUT",
+  "VAR_IN_OUT",
+]);
+
+function upperName(name: string): string {
+  return name.toUpperCase();
+}
+
+/** `MC.MC_Power` and `MC_Power` are the same motion FB. The leaf carries the prefix. */
+function typeLeaf(name: string): string {
+  const upper = upperName(name);
+  const dot = upper.lastIndexOf(".");
+  return dot >= 0 ? upper.slice(dot + 1) : upper;
+}
+
+function namedType(
+  types: Map<string, TypeDeclaration>,
+  name: string,
+): TypeDeclaration | undefined {
+  return types.get(upperName(name)) ?? types.get(typeLeaf(name));
+}
+
+function isStructOrEnum(
+  types: Map<string, TypeDeclaration>,
+  name: string,
+): boolean {
+  const named = namedType(types, name);
+  if (!named) {
+    return false;
+  }
+  return (
+    named.definition.kind === "StructDefinition" ||
+    named.definition.kind === "EnumDefinition"
+  );
+}
+
+function isMotionFbTypeName(
+  name: string,
+  types: Map<string, TypeDeclaration>,
+): boolean {
+  const leaf = typeLeaf(name);
+  if (!MOTION_FB_TYPE_PREFIXES.some((prefix) => leaf.startsWith(prefix))) {
+    return false;
+  }
+  return !isStructOrEnum(types, name);
+}
+
+/**
+ * True when `typeName` stores an MC_* / ETC_* / SMC_* FB.
+ * Walks EXTENDS, TYPE aliases, arrays, and struct fields. VAR_IN_OUT and
+ * VAR_INPUT are references, not storage. A library FB with an empty
+ * declaration uses the symbol-table locals.
+ */
+function typeHoldsMotionFb(
+  typeName: string,
+  elementTypeName: string | undefined,
+  fbs: Map<string, FunctionBlockDeclaration>,
+  types: Map<string, TypeDeclaration>,
+  tables: SymbolTables,
+  seen: Set<string>,
+): boolean {
+  const key = upperName(typeName);
+  if (seen.has(key)) {
+    return false;
+  }
+  seen.add(key);
+  if (
+    elementTypeName !== undefined &&
+    typeHoldsMotionFb(elementTypeName, undefined, fbs, types, tables, seen)
+  ) {
+    return true;
+  }
+  if (isMotionFbTypeName(typeName, types)) {
+    return true;
+  }
+  const chain = fbExtendsChain(typeName, fbs, new Set<string>());
+  for (const fb of chain) {
+    if (varBlocksHoldMotionFb(fb.varBlocks, fbs, types, tables, seen)) {
+      return true;
+    }
+  }
+  const sym = tables.globalScope.lookup(typeLeaf(typeName));
+  if (
+    sym?.kind === "functionBlock" &&
+    sym.declaration.varBlocks.length === 0 &&
+    varSymbolsHoldMotionFb(sym.locals, fbs, types, tables, seen)
+  ) {
+    return true;
+  }
+  return namedTypeHoldsMotionFb(typeName, fbs, types, tables, seen);
+}
+
+function varBlocksHoldMotionFb(
+  blocks: VarBlock[],
+  fbs: Map<string, FunctionBlockDeclaration>,
+  types: Map<string, TypeDeclaration>,
+  tables: SymbolTables,
+  seen: Set<string>,
+): boolean {
+  for (const block of blocks) {
+    if (MOTION_STORAGE_SKIP.has(block.blockType)) {
+      continue;
+    }
+    for (const decl of block.declarations) {
+      if (
+        typeHoldsMotionFb(
+          decl.type.name,
+          decl.type.elementTypeName,
+          fbs,
+          types,
+          tables,
+          seen,
+        )
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function varSymbolsHoldMotionFb(
+  locals: { isInOut: boolean; isInput: boolean; declaration: VarDeclaration }[],
+  fbs: Map<string, FunctionBlockDeclaration>,
+  types: Map<string, TypeDeclaration>,
+  tables: SymbolTables,
+  seen: Set<string>,
+): boolean {
+  for (const local of locals) {
+    if (local.isInOut || local.isInput) {
+      continue;
+    }
+    if (
+      typeHoldsMotionFb(
+        local.declaration.type.name,
+        local.declaration.type.elementTypeName,
+        fbs,
+        types,
+        tables,
+        seen,
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function namedTypeHoldsMotionFb(
+  typeName: string,
+  fbs: Map<string, FunctionBlockDeclaration>,
+  types: Map<string, TypeDeclaration>,
+  tables: SymbolTables,
+  seen: Set<string>,
+): boolean {
+  const named = namedType(types, typeName);
+  if (!named) {
+    return false;
+  }
+  const def = named.definition;
+  if (def.kind === "StructDefinition") {
+    for (const field of def.fields) {
+      if (
+        typeHoldsMotionFb(
+          field.type.name,
+          field.type.elementTypeName,
+          fbs,
+          types,
+          tables,
+          seen,
+        )
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (def.kind === "ArrayDefinition") {
+    return typeHoldsMotionFb(
+      def.elementType.name,
+      def.elementType.elementTypeName,
+      fbs,
+      types,
+      tables,
+      seen,
+    );
+  }
+  if (def.kind === "TypeReference") {
+    return typeHoldsMotionFb(
+      def.name,
+      def.elementTypeName,
+      fbs,
+      types,
+      tables,
+      seen,
+    );
+  }
+  if (def.kind === "SubrangeDefinition") {
+    return typeHoldsMotionFb(
+      def.baseType.name,
+      def.baseType.elementTypeName,
+      fbs,
+      types,
+      tables,
+      seen,
+    );
+  }
+  return false;
+}
+
+interface GlobalFbDecl {
+  display: string;
+  typeName: string;
+  elementTypeName: string | undefined;
+  span: SourceSpan;
+}
+
+function collectGlobalFbDecls(ast: CompilationUnit): Map<string, GlobalFbDecl> {
+  const globals = new Map<string, GlobalFbDecl>();
+  const take = (blocks: VarBlock[]): void => {
+    for (const block of blocks) {
+      if (block.blockType !== "VAR_GLOBAL" || block.isConstant) {
+        continue;
+      }
+      for (const decl of block.declarations) {
+        for (const name of decl.names) {
+          globals.set(upperName(name), {
+            display: name,
+            typeName: decl.type.name,
+            elementTypeName: decl.type.elementTypeName,
+            span: decl.sourceSpan,
+          });
+        }
+      }
+    }
+  };
+  take(ast.globalVarBlocks);
+  for (const config of ast.configurations) {
+    take(config.varBlocks);
+  }
+  return globals;
+}
+
+const POU_PROGRAM = "program:";
+const POU_FB = "fb:";
+const POU_FN = "fn:";
+
+interface PouRef {
+  id: string;
+  span: SourceSpan;
+}
+
+interface ProgramInst {
+  typeName: string;
+  task: string;
+  span: SourceSpan;
+}
+
+function indexFunctionBlocks(
+  ast: CompilationUnit,
+): Map<string, FunctionBlockDeclaration> {
+  const fbs = new Map<string, FunctionBlockDeclaration>();
+  for (const fb of ast.functionBlocks) {
+    fbs.set(upperName(fb.name), fb);
+    fbs.set(typeLeaf(fb.name), fb);
+  }
+  return fbs;
+}
+
+function listProgramInstances(ast: CompilationUnit): ProgramInst[] {
+  const out: ProgramInst[] = [];
+  for (const config of ast.configurations) {
+    for (const resource of config.resources) {
+      for (const inst of resource.programInstances) {
+        out.push({
+          typeName: upperName(inst.programType),
+          task: inst.taskName ? upperName(inst.taskName) : "",
+          span: inst.sourceSpan,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+function motionGlobalPouRefs(
+  ast: CompilationUnit,
+  globals: Map<string, GlobalFbDecl>,
+): Map<string, PouRef[]> {
+  const refs = new Map<string, PouRef[]>();
+  const note = (globalKey: string, id: string, span: SourceSpan): void => {
+    if (!globals.has(globalKey)) {
+      return;
+    }
+    const list = refs.get(globalKey) ?? [];
+    if (!list.some((item) => item.id === id)) {
+      list.push({ id, span });
+    }
+    refs.set(globalKey, list);
+  };
+  const localsOf = (blocks: VarBlock[]): Set<string> => {
+    const names = new Set<string>();
+    for (const block of blocks) {
+      if (block.blockType === "VAR_EXTERNAL") {
+        continue;
+      }
+      for (const decl of block.declarations) {
+        for (const name of decl.names) {
+          names.add(upperName(name));
+        }
+      }
+    }
+    return names;
+  };
+  const scanBody = (
+    id: string,
+    locals: Set<string>,
+    body: Statement[],
+  ): void => {
+    for (const stmt of body) {
+      walkAST(stmt, (node) => {
+        if (node.kind === "FunctionCallExpression") {
+          const call = node as FunctionCallExpression;
+          const head = call.functionName.split(".")[0] ?? call.functionName;
+          if (!locals.has(upperName(head))) {
+            note(upperName(head), id, call.sourceSpan);
+          }
+        } else if (node.kind === "VariableExpression") {
+          const variable = node as VariableExpression;
+          const varKey = upperName(variable.name);
+          if (!locals.has(varKey)) {
+            note(varKey, id, variable.sourceSpan);
+          }
+        }
+      });
+    }
+  };
+  const scan = (id: string, blocks: VarBlock[], body: Statement[]): void => {
+    for (const block of blocks) {
+      if (block.blockType !== "VAR_EXTERNAL") {
+        continue;
+      }
+      for (const decl of block.declarations) {
+        for (const name of decl.names) {
+          note(upperName(name), id, decl.sourceSpan);
+        }
+      }
+    }
+    scanBody(id, localsOf(blocks), body);
+  };
+  for (const prog of ast.programs) {
+    scan(POU_PROGRAM + upperName(prog.name), prog.varBlocks, prog.body);
+  }
+  for (const fn of ast.functions) {
+    scan(POU_FN + upperName(fn.name), fn.varBlocks, fn.body);
+  }
+  for (const fb of ast.functionBlocks) {
+    const id = POU_FB + upperName(fb.name);
+    const locals = localsOf(fb.varBlocks);
+    scan(id, fb.varBlocks, fb.body);
+    for (const method of fb.methods) {
+      scan(id, [...fb.varBlocks, ...method.varBlocks], method.body);
+    }
+    for (const prop of fb.properties) {
+      if (prop.getter) {
+        scanBody(id, locals, prop.getter);
+      }
+      if (prop.setter) {
+        scanBody(id, locals, prop.setter);
+      }
+    }
+  }
+  return refs;
+}
+
+function fbExtendsChain(
+  name: string,
+  fbs: Map<string, FunctionBlockDeclaration>,
+  seen: Set<string>,
+): FunctionBlockDeclaration[] {
+  const chain: FunctionBlockDeclaration[] = [];
+  let current = fbs.get(typeLeaf(name)) ?? fbs.get(upperName(name));
+  while (current) {
+    const id = upperName(current.name);
+    if (seen.has(id)) {
+      break;
+    }
+    seen.add(id);
+    chain.push(current);
+    if (!current.extends) {
+      break;
+    }
+    current =
+      fbs.get(typeLeaf(current.extends)) ?? fbs.get(upperName(current.extends));
+  }
+  return chain;
+}
+
+function indexNamedTypes(ast: CompilationUnit): Map<string, TypeDeclaration> {
+  const types = new Map<string, TypeDeclaration>();
+  for (const decl of ast.types) {
+    types.set(upperName(decl.name), decl);
+    types.set(typeLeaf(decl.name), decl);
+  }
+  return types;
+}
+
+function oneTypeReachesTarget(
+  name: string,
+  targets: Set<string>,
+  fbs: Map<string, FunctionBlockDeclaration>,
+  types: Map<string, TypeDeclaration>,
+  seen: Set<string>,
+): boolean {
+  const leaf = typeLeaf(name);
+  if (seen.has(leaf)) {
+    return false;
+  }
+  seen.add(leaf);
+  const chain = fbExtendsChain(name, fbs, new Set<string>());
+  for (const fb of chain) {
+    if (targets.has(upperName(fb.name)) || targets.has(typeLeaf(fb.name))) {
+      return true;
+    }
+  }
+  for (const fb of chain) {
+    if (blocksReachFb(fb.varBlocks, targets, fbs, types, seen)) {
+      return true;
+    }
+  }
+  const named = types.get(leaf);
+  if (!named) {
+    return false;
+  }
+  const def = named.definition;
+  if (def.kind === "StructDefinition") {
+    for (const field of def.fields) {
+      if (
+        typeReachesTarget(
+          field.type.name,
+          field.type.elementTypeName,
+          targets,
+          fbs,
+          types,
+          seen,
+        )
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (def.kind === "ArrayDefinition") {
+    return typeReachesTarget(
+      def.elementType.name,
+      def.elementType.elementTypeName,
+      targets,
+      fbs,
+      types,
+      seen,
+    );
+  }
+  if (def.kind === "TypeReference") {
+    return typeReachesTarget(
+      def.name,
+      def.elementTypeName,
+      targets,
+      fbs,
+      types,
+      seen,
+    );
+  }
+  if (def.kind === "SubrangeDefinition") {
+    return typeReachesTarget(
+      def.baseType.name,
+      def.baseType.elementTypeName,
+      targets,
+      fbs,
+      types,
+      seen,
+    );
+  }
+  return false;
+}
+
+function typeReachesTarget(
+  typeName: string,
+  elementTypeName: string | undefined,
+  targets: Set<string>,
+  fbs: Map<string, FunctionBlockDeclaration>,
+  types: Map<string, TypeDeclaration>,
+  seen: Set<string>,
+): boolean {
+  if (oneTypeReachesTarget(typeName, targets, fbs, types, seen)) {
+    return true;
+  }
+  if (elementTypeName === undefined) {
+    return false;
+  }
+  return oneTypeReachesTarget(elementTypeName, targets, fbs, types, seen);
+}
+
+function blocksReachFb(
+  blocks: VarBlock[],
+  targets: Set<string>,
+  fbs: Map<string, FunctionBlockDeclaration>,
+  types: Map<string, TypeDeclaration>,
+  seen: Set<string>,
+): boolean {
+  for (const block of blocks) {
+    if (block.blockType === "VAR_TEMP") {
+      continue;
+    }
+    for (const decl of block.declarations) {
+      if (
+        typeReachesTarget(
+          decl.type.name,
+          decl.type.elementTypeName,
+          targets,
+          fbs,
+          types,
+          seen,
+        )
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function programsTouchingMotionGlobal(
+  ast: CompilationUnit,
+  fbs: Map<string, FunctionBlockDeclaration>,
+  touching: PouRef[],
+): Set<string> {
+  const fbTargets = new Set<string>();
+  const directPrograms = new Set<string>();
+  for (const ref of touching) {
+    if (ref.id.startsWith(POU_FB)) {
+      fbTargets.add(ref.id.slice(POU_FB.length));
+    } else if (ref.id.startsWith(POU_PROGRAM)) {
+      directPrograms.add(ref.id.slice(POU_PROGRAM.length));
+    }
+  }
+  const programs = new Set<string>(directPrograms);
+  if (fbTargets.size === 0) {
+    return programs;
+  }
+  const types = indexNamedTypes(ast);
+  for (const prog of ast.programs) {
+    const name = upperName(prog.name);
+    if (programs.has(name)) {
+      continue;
+    }
+    if (
+      blocksReachFb(prog.varBlocks, fbTargets, fbs, types, new Set<string>())
+    ) {
+      programs.add(name);
+    }
+  }
+  return programs;
 }
 
 /**
