@@ -674,4 +674,135 @@ describe("motion FB instance single task", () => {
     `);
     expect(hasSingleTaskError(messages)).toBe(true);
   });
+
+  it("rejects SUPER^() when the library base stores MC_Power", () => {
+    const lib = compileStlib(
+      [{
+        fileName: "base.st",
+        source: `
+          FUNCTION_BLOCK MC_Power
+            VAR_INPUT Enable : BOOL; END_VAR
+          END_FUNCTION_BLOCK
+          FUNCTION_BLOCK FB_Base
+            VAR
+              pwr : MC_Power;
+            END_VAR
+            pwr(Enable := TRUE);
+          END_FUNCTION_BLOCK
+        `,
+      }],
+      { name: "motion", version: "1.0.0" },
+    );
+    expect(lib.success).toBe(true);
+    const messages = compile(
+      `
+        FUNCTION_BLOCK FB_Child EXTENDS FB_Base
+          SUPER^();
+        END_FUNCTION_BLOCK
+        VAR_GLOBAL shared : FB_Child; END_VAR
+        PROGRAM FastProg
+          VAR_EXTERNAL shared : FB_Child; END_VAR
+          shared();
+        END_PROGRAM
+        PROGRAM SlowProg
+          VAR_EXTERNAL shared : FB_Child; END_VAR
+          shared();
+        END_PROGRAM
+        CONFIGURATION Config0
+          RESOURCE Res0 ON PLC
+            TASK FastTask(INTERVAL := T#1ms, PRIORITY := 0);
+            TASK SlowTask(INTERVAL := T#10ms, PRIORITY := 1);
+            PROGRAM INST0 WITH FastTask : FastProg;
+            PROGRAM INST1 WITH SlowTask : SlowProg;
+          END_RESOURCE
+        END_CONFIGURATION
+      `,
+      { libraries: [lib.archive!] },
+    ).errors.map((e) => e.message);
+    expect(hasSingleTaskError(messages)).toBe(true);
+  });
+
+  it("does not treat a library MC_TRACK struct as a motion FB", () => {
+    const lib = compileStlib(
+      [{
+        fileName: "track.st",
+        source: `
+          TYPE MC_TRACK : STRUCT
+            n : INT;
+          END_STRUCT END_TYPE
+        `,
+      }],
+      { name: "motion", version: "1.0.0", namespace: "MC" },
+    );
+    expect(lib.success).toBe(true);
+    const messages = compile(
+      `
+        VAR_GLOBAL shared : MC.MC_TRACK; END_VAR
+        PROGRAM FastProg
+          VAR_EXTERNAL shared : MC.MC_TRACK; END_VAR
+          shared.n := 1;
+        END_PROGRAM
+        PROGRAM SlowProg
+          VAR_EXTERNAL shared : MC.MC_TRACK; END_VAR
+          shared.n := 2;
+        END_PROGRAM
+        CONFIGURATION Config0
+          RESOURCE Res0 ON PLC
+            TASK MainTask(INTERVAL := T#1ms, PRIORITY := 0);
+            PROGRAM INST0 WITH MainTask : FastProg;
+            PROGRAM INST1 WITH MainTask : SlowProg;
+          END_RESOURCE
+        END_CONFIGURATION
+      `,
+      { libraries: [lib.archive!] },
+    ).errors.map((e) => e.message);
+    expect(hasSingleTaskError(messages)).toBe(false);
+  });
+
+  it("rejects a qualified function-block call that has no instance", () => {
+    const mc = compileStlib(
+      [{
+        fileName: "mc.st",
+        source: `
+          FUNCTION_BLOCK MC_Power
+            VAR_INPUT Enable : BOOL; END_VAR
+            VAR_IN_OUT Axis : INT; END_VAR
+          END_FUNCTION_BLOCK
+        `,
+      }],
+      { name: "mc", version: "1.0.0", namespace: "MC" },
+    );
+    expect(mc.success).toBe(true);
+    const messages = compile(
+      `
+        PROGRAM Main
+          VAR ax : INT; END_VAR
+          MC.MC_Power(Enable := TRUE, Axis := ax);
+        END_PROGRAM
+      `,
+      { libraries: [mc.archive!] },
+    ).errors.map((e) => e.message);
+    expect(messages.some((m) => m.includes("must be called on an instance"))).toBe(
+      true,
+    );
+  });
+
+  it("copies a positional VAR_IN_OUT back to the caller", () => {
+    const result = compile(`
+      FUNCTION_BLOCK MC_Power
+        VAR_INPUT Enable : BOOL; END_VAR
+        VAR_IN_OUT Axis : INT; END_VAR
+      END_FUNCTION_BLOCK
+      PROGRAM Main
+        VAR
+          pwr : MC_Power;
+          ax : INT;
+        END_VAR
+        pwr(TRUE, ax);
+      END_PROGRAM
+    `);
+    expect(result.errors).toEqual([]);
+    expect(result.cppCode).toContain("AX = PWR.AXIS");
+    expect(result.cppCode).toContain("PWR.AXIS = AX");
+  });
 });

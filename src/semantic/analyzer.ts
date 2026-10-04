@@ -3666,8 +3666,31 @@ export class SemanticAnalyzer {
           const libFb = this.symbolTables.lookupFunctionBlock(
             expr.functionName,
           );
+          if (libFb && !libFn && local?.kind !== "variable") {
+            this.addError(
+              `Function block '${expr.functionName}' must be called on an instance`,
+              expr.sourceSpan.startLine,
+              expr.sourceSpan.startCol,
+              expr.sourceSpan.file,
+            );
+          }
           if (local?.kind === "variable" || (!libFn && !libFb)) {
             this.checkNameDeclared(objName, scope, ctx, expr.sourceSpan);
+          }
+        }
+        if (!expr.functionName.includes(".")) {
+          const bareFb = this.symbolTables.lookupFunctionBlock(
+            expr.functionName,
+          );
+          const bareFn = this.symbolTables.lookupFunction(expr.functionName);
+          const bareLocal = scope.lookup(expr.functionName);
+          if (bareFb && !bareFn && bareLocal?.kind !== "variable") {
+            this.addError(
+              `Function block '${expr.functionName}' must be called on an instance`,
+              expr.sourceSpan.startLine,
+              expr.sourceSpan.startCol,
+              expr.sourceSpan.file,
+            );
           }
         }
         // An FB instance reached through an expression (`units[0]()`) — check
@@ -4276,8 +4299,12 @@ function namedType(
 function isStructOrEnum(
   types: Map<string, TypeDeclaration>,
   name: string,
+  tables: SymbolTables,
 ): boolean {
-  const named = namedType(types, name);
+  const named =
+    namedType(types, name) ??
+    tables.lookupType(name)?.declaration ??
+    tables.lookupType(typeLeaf(name))?.declaration;
   if (!named) {
     return false;
   }
@@ -4290,12 +4317,13 @@ function isStructOrEnum(
 function isMotionFbTypeName(
   name: string,
   types: Map<string, TypeDeclaration>,
+  tables: SymbolTables,
 ): boolean {
   const leaf = typeLeaf(name);
   if (!MOTION_FB_TYPE_PREFIXES.some((prefix) => leaf.startsWith(prefix))) {
     return false;
   }
-  return !isStructOrEnum(types, name);
+  return !isStructOrEnum(types, name, tables);
 }
 
 /**
@@ -4323,7 +4351,7 @@ function typeHoldsMotionFb(
   ) {
     return true;
   }
-  if (isMotionFbTypeName(typeName, types)) {
+  if (isMotionFbTypeName(typeName, types, tables)) {
     return true;
   }
   const chain = fbExtendsChain(typeName, fbs, new Set<string>());
@@ -4332,10 +4360,22 @@ function typeHoldsMotionFb(
       return true;
     }
   }
-  const sym = tables.globalScope.lookup(typeLeaf(typeName));
+  const tail = chain[chain.length - 1];
+  if (tail?.extends) {
+    const parentInAst =
+      fbs.get(typeLeaf(tail.extends)) ?? fbs.get(upperName(tail.extends));
+    if (
+      !parentInAst &&
+      typeHoldsMotionFb(tail.extends, undefined, fbs, types, tables, seen)
+    ) {
+      return true;
+    }
+  }
+  const sym =
+    tables.lookupFunctionBlock(typeName) ??
+    tables.lookupFunctionBlock(typeLeaf(typeName));
   if (
-    sym?.kind === "functionBlock" &&
-    sym.declaration.varBlocks.length === 0 &&
+    sym !== undefined &&
     varSymbolsHoldMotionFb(sym.locals, fbs, types, tables, seen)
   ) {
     return true;
@@ -4406,7 +4446,10 @@ function namedTypeHoldsMotionFb(
   tables: SymbolTables,
   seen: Set<string>,
 ): boolean {
-  const named = namedType(types, typeName);
+  const named =
+    namedType(types, typeName) ??
+    tables.lookupType(typeName)?.declaration ??
+    tables.lookupType(typeLeaf(typeName))?.declaration;
   if (!named) {
     return false;
   }
