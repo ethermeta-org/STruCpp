@@ -230,6 +230,10 @@ END_TEST
 
 The CLI `--test` mode compiles source + test files, generates a C++ test runner, compiles with g++, and executes. Assertions include ASSERT_EQ, ASSERT_NE, ASSERT_TRUE, ASSERT_FALSE, ASSERT_GT, ASSERT_LT. Mock support allows stubbing functions and FB instances per test.
 
+## Motion function-block instances
+
+An `MC_` / `ETC_` / `SMC_` instance writes one mailbox. The analyzer rejects that instance when two PLC tasks, or two PROGRAM instances, call it. The walk includes a library base reached by `EXTENDS` and a struct or array field. A library `STRUCT` or `ENUM` whose leaf name has those prefixes is data, not an instance. `Namespace.FB(...)` with no instance is an error. Positional arguments bind `VAR_INPUT` and `VAR_IN_OUT` in declaration order and copy `VAR_IN_OUT` back. A library archive stores those two lists separately, so a library block is inputs then inouts.
+
 ## Error Handling
 
 All errors are `CompileError` objects with `message`, `line`, `column`, `severity` ("error" | "warning" | "info"), and optional `file` context. Parse errors fail fast. Semantic errors abort code generation. Warnings (narrowing conversions, type mismatches in FOR bounds) are collected but allow codegen to proceed.

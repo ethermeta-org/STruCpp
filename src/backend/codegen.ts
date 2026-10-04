@@ -533,6 +533,9 @@ export class CodeGenerator {
   /** Map of UPPER(fbTypeName) → ordered VAR_INPUT parameter names (UPPER case).
    *  Used to resolve positional arguments in FB invocations. */
   private fbInputParams: Map<string, string[]> = new Map();
+  /** Declaration order of VAR_INPUT and VAR_IN_OUT. Library archives
+   * store the two lists separately, so a library FB is inputs then inouts. */
+  private fbCallParams: Map<string, string[]> = new Map();
 
   /** Map of UPPER(fbTypeName) → set of VAR_IN_OUT parameter names (UPPER case).
    *  FB inout params are stored as by-value members with copy-in at the call
@@ -816,13 +819,26 @@ export class CodeGenerator {
       if (sourceNamespace) {
         this.knownFBTypes.add(`${sourceNamespace}.${fb.name}`.toUpperCase());
       }
-      if (fb.inputNames.length > 0) {
-        const inputNames = fb.inputNames.map((n) => n.toUpperCase());
+      const inputNames = fb.inputNames.map((n) => n.toUpperCase());
+      const callNames = [
+        ...inputNames,
+        ...fb.inoutNames.map((n) => n.toUpperCase()),
+      ];
+      if (inputNames.length > 0) {
         this.fbInputParams.set(fbUpper, inputNames);
         if (sourceNamespace) {
           this.fbInputParams.set(
             `${sourceNamespace}.${fb.name}`.toUpperCase(),
             inputNames,
+          );
+        }
+      }
+      if (callNames.length > 0) {
+        this.fbCallParams.set(fbUpper, callNames);
+        if (sourceNamespace) {
+          this.fbCallParams.set(
+            `${sourceNamespace}.${fb.name}`.toUpperCase(),
+            callNames,
           );
         }
       }
@@ -1105,23 +1121,30 @@ export class CodeGenerator {
       // Build ordered input parameter names for positional argument resolution
       const inputNames: string[] = [];
       const inoutNames: string[] = [];
+      const callNames: string[] = [];
       for (const block of fb.varBlocks) {
-        if (block.blockType === "VAR_INPUT") {
-          for (const decl of block.declarations) {
-            for (const name of decl.names) {
-              inputNames.push(name.toUpperCase());
-            }
-          }
-        } else if (block.blockType === "VAR_IN_OUT") {
-          for (const decl of block.declarations) {
-            for (const name of decl.names) {
-              inoutNames.push(name.toUpperCase());
+        const isInput = block.blockType === "VAR_INPUT";
+        const isInout = block.blockType === "VAR_IN_OUT";
+        if (!isInput && !isInout) {
+          continue;
+        }
+        for (const decl of block.declarations) {
+          for (const name of decl.names) {
+            const upper = name.toUpperCase();
+            callNames.push(upper);
+            if (isInput) {
+              inputNames.push(upper);
+            } else {
+              inoutNames.push(upper);
             }
           }
         }
       }
       if (inputNames.length > 0) {
         this.fbInputParams.set(fb.name.toUpperCase(), inputNames);
+      }
+      if (callNames.length > 0) {
+        this.fbCallParams.set(fb.name.toUpperCase(), callNames);
       }
       if (inoutNames.length > 0) {
         this.fbInoutParams.set(fb.name.toUpperCase(), new Set(inoutNames));
@@ -5548,33 +5571,40 @@ export class CodeGenerator {
       call.functionName,
       call.instance !== undefined,
     );
-    const inputParamNames = fbTypeName
-      ? this.fbInputParams.get(fbTypeName.toUpperCase())
+    const callParamNames = fbTypeName
+      ? this.fbCallParams.get(fbTypeName.toUpperCase())
+      : undefined;
+    const inoutParams = fbTypeName
+      ? this.fbInoutParams.get(fbTypeName.toUpperCase())
       : undefined;
 
-    // Assign input parameters (named or positional)
+    // Assign VAR_INPUT and VAR_IN_OUT (named or positional). Outputs stay =>.
     let positionalIndex = 0;
+    const inoutWriteback: Array<{ value: Expression; member: string }> = [];
     for (const arg of filteredArgs) {
       if (arg.isOutput) continue;
-
-      if (arg.name) {
-        // Named argument: assign directly
-        this.emit(
-          `${indent}${instanceName}.${this.fbParamMemberName(arg.name, fbTypeName)} = ${this.generateExpression(arg.value)};`,
-        );
-      } else if (inputParamNames && positionalIndex < inputParamNames.length) {
-        // Positional argument: map to VAR_INPUT by position
-        const paramName = inputParamNames[positionalIndex];
-        this.emit(
-          `${indent}${instanceName}.${this.fbParamMemberName(paramName!, fbTypeName)} = ${this.generateExpression(arg.value)};`,
-        );
+      let paramName = arg.name?.toUpperCase();
+      if (
+        !paramName &&
+        callParamNames &&
+        positionalIndex < callParamNames.length
+      ) {
+        paramName = callParamNames[positionalIndex];
         positionalIndex++;
-      } else {
-        // Positional argument without type info — emit as warning comment
+      }
+      if (!paramName) {
         this.emit(
           `${indent}// WARNING: positional argument ${positionalIndex} could not be resolved`,
         );
         positionalIndex++;
+        continue;
+      }
+      const member = this.fbParamMemberName(paramName, fbTypeName);
+      this.emit(
+        `${indent}${instanceName}.${member} = ${this.generateExpression(arg.value)};`,
+      );
+      if (inoutParams && inoutParams.has(paramName)) {
+        inoutWriteback.push({ value: arg.value, member });
       }
     }
 
@@ -5597,20 +5627,12 @@ export class CodeGenerator {
     // require both directions). Mirrors the graphical-language convention of
     // tying an inout pin on both sides. A follow-up strucpp branch replaces this
     // copy-in/copy-out with by-reference (pointer) inout members.
-    const inoutParams = fbTypeName
-      ? this.fbInoutParams.get(fbTypeName.toUpperCase())
-      : undefined;
-    if (inoutParams && inoutParams.size > 0) {
-      for (const arg of filteredArgs) {
-        if (arg.isOutput) continue;
-        if (arg.name && inoutParams.has(arg.name.toUpperCase())) {
-          this.emitCaptureToLvalue(
-            arg.value,
-            `${instanceName}.${this.fbParamMemberName(arg.name, fbTypeName)}`,
-            indent,
-          );
-        }
-      }
+    for (const back of inoutWriteback) {
+      this.emitCaptureToLvalue(
+        back.value,
+        `${instanceName}.${back.member}`,
+        indent,
+      );
     }
 
     // Capture output arguments (=> syntax), excluding ENO (already handled)
