@@ -105,6 +105,12 @@ export interface CompileOptions {
    * Production compiles leave it off and see no output change.
    */
   emitChunkMarkers?: boolean;
+
+  /**
+   * Engineering configuration. Default false: generated C++ has no
+   * `plc_debug_probe` calls and the debug map omits `pous` / `statements`.
+   */
+  emitDebugProbes?: boolean;
 }
 
 /**
