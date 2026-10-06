@@ -33,6 +33,12 @@ import type {
   PropertyDeclaration,
   Visibility,
 } from "../frontend/ast.js";
+import {
+  claimInstructionId,
+  InstructionMapError,
+  PLC_DEBUG_INSTR_ID_FIRST,
+  type DebugStatementEntry,
+} from "./debug-table-gen.js";
 import type { SymbolTables } from "../semantic/symbol-table.js";
 import type { LineMapEntry } from "../types.js";
 import { StdFunctionRegistry } from "../semantic/std-function-registry.js";
@@ -224,6 +230,12 @@ export interface CodeGenOptions {
    *  for function-level tree-shaking. Off by default — production
    *  compiles produce identical output regardless. */
   emitChunkMarkers?: boolean;
+
+  /**
+   * Engineering compile only. Production default is false: no
+   * `plc_debug_probe` calls and no statement rows in the debug map.
+   */
+  emitDebugProbes?: boolean;
 }
 
 /**
@@ -316,6 +328,7 @@ export const defaultCodeGenOptions: CodeGenOptions = {
   isTestBuild: false,
   globalConstants: {},
   fileName: "main.st",
+  emitDebugProbes: false,
 };
 
 // =============================================================================
@@ -354,6 +367,12 @@ export interface CodeGenResult {
     column?: number;
     file?: string;
   }>;
+
+  /** POU names in compilation-unit order. Empty when probes are off. */
+  debugPous: string[];
+
+  /** Statement rows allocated while emitting. Empty when probes are off. */
+  debugStatements: DebugStatementEntry[];
 }
 
 // =============================================================================
@@ -432,6 +451,12 @@ export class CodeGenerator {
 
   /** Current statement indent level (set by generateStatement before expression generation) */
   private currentStatementIndent = "    ";
+
+  private debugPous: string[] = [];
+  private debugStatements: DebugStatementEntry[] = [];
+  private pouIdByUpper = new Map<string, number>();
+  private nextInstructionId = PLC_DEBUG_INSTR_ID_FIRST;
+  private currentPouId: number | undefined;
 
   /** Set of known function block type names (upper case) for FB instance detection */
   protected knownFBTypes: Set<string> = new Set();
@@ -1071,6 +1096,12 @@ export class CodeGenerator {
     for (const extra of this.options.pouIncludes) {
       this.emit(`#include "${extra}"`);
     }
+    if (this.options.emitDebugProbes) {
+      this.emit("#include <cstdint>");
+      this.emit(
+        'extern "C" void plc_debug_probe(std::uint32_t instruction_id);',
+      );
+    }
     this.emit("");
     this.emit(`namespace ${ns} {`);
     this.emit("");
@@ -1113,6 +1144,12 @@ export class CodeGenerator {
     this.codegenWarnings = [];
     this.tempVarCounter = 0;
     this.ast = ast; // Store AST for looking up program bodies
+    this.debugPous = [];
+    this.debugStatements = [];
+    this.pouIdByUpper = new Map();
+    this.nextInstructionId = PLC_DEBUG_INSTR_ID_FIRST;
+    this.currentPouId = undefined;
+    this.registerCompilationPous(ast);
 
     // Build set of known FB types from AST (library FB types already registered
     // via registerLibraryFBTypes() before generate() is called)
@@ -1231,7 +1268,102 @@ export class CodeGenerator {
       lineMap: this.lineMap,
       headerLineMap: this.headerLineMap,
       warnings: this.codegenWarnings,
+      debugPous: this.debugPous,
+      debugStatements: this.debugStatements,
     };
+  }
+
+  /**
+   * First appearance in the compilation unit. Statement emission only reads the id.
+   * ponytail: extra files after the primary are ordered by file name, then line.
+   * Use additionalSources order if a multi-file pou_id must follow merge order.
+   */
+  private registerCompilationPous(ast: CompilationUnit): void {
+    if (!this.options.emitDebugProbes) {
+      return;
+    }
+    const rows: Array<{ name: string; file: string; line: number }> = [];
+    const push = (name: string, file: string, line: number) => {
+      rows.push({ name, file, line });
+    };
+    for (const prog of ast.programs) {
+      push(prog.name, prog.sourceSpan.file, prog.sourceSpan.startLine);
+    }
+    for (const fb of ast.functionBlocks) {
+      push(fb.name, fb.sourceSpan.file, fb.sourceSpan.startLine);
+    }
+    for (const fn of ast.functions) {
+      push(fn.name, fn.sourceSpan.file, fn.sourceSpan.startLine);
+    }
+    const primary = this.options.fileName;
+    const fileRank = (file: string) =>
+      file === "" || file === primary ? 0 : 1;
+    rows.sort((a, b) => {
+      const byFile = fileRank(a.file) - fileRank(b.file);
+      if (byFile !== 0) {
+        return byFile;
+      }
+      if (a.file !== b.file) {
+        return a.file < b.file ? -1 : 1;
+      }
+      return a.line - b.line;
+    });
+    for (const row of rows) {
+      this.noteDebugPou(row.name);
+    }
+  }
+
+  private noteDebugPou(name: string): void {
+    const key = name.toUpperCase();
+    if (this.pouIdByUpper.has(key)) {
+      return;
+    }
+    this.pouIdByUpper.set(key, this.debugPous.length);
+    this.debugPous.push(name);
+  }
+
+  /** Bind the POU currently being emitted. Does not allocate an instruction id. */
+  private enterDebugPou(name: string): void {
+    if (!this.options.emitDebugProbes) {
+      return;
+    }
+    this.noteDebugPou(name);
+    this.currentPouId = this.pouIdByUpper.get(name.toUpperCase());
+  }
+
+  /**
+   * One probe per executable statement when the engineering switch is on.
+   * Production compiles return before any id is allocated.
+   */
+  private emitStatementProbe(stmt: Statement, indent: string): void {
+    if (!this.options.emitDebugProbes || stmt.kind === "AssertCall") {
+      return;
+    }
+    const file = stmt.sourceSpan.file || this.options.fileName;
+    const line = stmt.sourceSpan.startLine;
+    const column = stmt.sourceSpan.startCol;
+    if (this.currentPouId === undefined) {
+      throw new InstructionMapError(
+        file,
+        line,
+        column,
+        "statement is outside a POU",
+      );
+    }
+    const instructionId = claimInstructionId(this.nextInstructionId, {
+      file,
+      line,
+      column,
+    });
+    this.nextInstructionId = instructionId + PLC_DEBUG_INSTR_ID_FIRST;
+    this.debugStatements.push({
+      instructionId,
+      file,
+      line,
+      column,
+      pou_id: this.currentPouId,
+    });
+    this.emit(`${indent}::plc_debug_probe(${instructionId}u);`);
   }
 
   /**
@@ -2271,6 +2403,7 @@ export class CodeGenerator {
   private generateProgramImplementation(
     prog: CompilationUnit["programs"][0],
   ): void {
+    this.enterDebugPou(prog.name);
     // Constructor
     this.emit(`Program_${prog.name}::Program_${prog.name}() {`);
     this.emit("    // Initialize variables");
@@ -2311,6 +2444,7 @@ export class CodeGenerator {
     this.emit("}");
     this.emit("");
     this.recordLineMapping(prog.sourceSpan.endLine, closingBraceLine);
+    this.currentPouId = undefined;
   }
 
   /**
@@ -2319,6 +2453,7 @@ export class CodeGenerator {
   private generateFBImplementation(
     fb: CompilationUnit["functionBlocks"][0],
   ): void {
+    this.enterDebugPou(fb.name);
     this.currentFBName = fb.name;
     this.currentFBExtends = fb.extends;
     this.currentFBVarBlocks = fb.varBlocks;
@@ -2418,6 +2553,7 @@ export class CodeGenerator {
     this.currentFBInterfaceMethods = new Set();
     this.programExternals = new Set();
     this.compositeExternals = new Set();
+    this.currentPouId = undefined;
   }
 
   /**
@@ -2426,6 +2562,7 @@ export class CodeGenerator {
   private generateFunctionImplementation(
     func: CompilationUnit["functions"][0],
   ): void {
+    this.enterDebugPou(func.name);
     const params = this.generateFunctionParams(func);
     const retType = this.mapTypeRefToCpp(func.returnType);
 
@@ -2493,6 +2630,7 @@ export class CodeGenerator {
       this.emit("");
       this.recordLineMapping(func.sourceSpan.startLine, funcImplLine);
     }
+    this.currentPouId = undefined;
   }
 
   /**
@@ -2694,6 +2832,7 @@ export class CodeGenerator {
    * Generate implementation for a program from the project model.
    */
   private generateProgramImplementationFromModel(prog: ProgramDecl): void {
+    this.enterDebugPou(prog.name);
     // Look up AST program for source span
     const astProg = this.ast?.programs.find(
       (p) => p.name.toUpperCase() === prog.name.toUpperCase(),
@@ -2805,6 +2944,7 @@ export class CodeGenerator {
     if (astProg) {
       this.recordLineMapping(astProg.sourceSpan.endLine, closingBraceLine);
     }
+    this.currentPouId = undefined;
   }
 
   /**
@@ -3150,6 +3290,7 @@ export class CodeGenerator {
    */
   protected generateStatement(stmt: Statement, indent: string = "    "): void {
     this.currentStatementIndent = indent;
+    this.emitStatementProbe(stmt, indent);
     this.emitLineDirective(stmt.sourceSpan.startLine);
     const cppStartLine = this.currentLine;
     // Compound statements handle their own line mappings internally

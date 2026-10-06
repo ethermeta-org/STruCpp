@@ -69,6 +69,7 @@ interface CLIOptions {
   inputs: string[];
   output?: string;
   debug: boolean;
+  emitDebugProbes: boolean;
   lineMapping: boolean;
   lineDirectives: boolean;
   sourceComments: boolean;
@@ -139,6 +140,7 @@ function parseArgs(args: string[]): CLIOptions {
   const options: CLIOptions = {
     inputs: [],
     debug: false,
+    emitDebugProbes: false,
     lineMapping: true,
     lineDirectives: false,
     sourceComments: false,
@@ -169,6 +171,8 @@ function parseArgs(args: string[]): CLIOptions {
       options.showVersion = true;
     } else if (arg === "-d" || arg === "--debug") {
       options.debug = true;
+    } else if (arg === "--emit-debug-probes") {
+      options.emitDebugProbes = true;
     } else if (arg === "--no-line-mapping") {
       options.lineMapping = false;
     } else if (arg === "--line-directives") {
@@ -303,6 +307,7 @@ Usage:
 Options:
   -o, --output <file>       Output file path (default: <input>.cpp)
   -d, --debug               Enable debug mode
+  --emit-debug-probes       Engineering build: plc_debug_probe + statement map
   --no-line-mapping         Disable line mapping
   --line-directives         Include #line directives in output
   --source-comments         Include ST source as comments
@@ -1063,6 +1068,7 @@ async function main(): Promise<void> {
   const effectiveLibPaths = getEffectiveLibraryPaths(options);
   const compileOptions: Partial<CompileOptions> = {
     debug: options.debug,
+    emitDebugProbes: options.emitDebugProbes,
     lineMapping: options.lineMapping,
     lineDirectives: options.lineDirectives,
     sourceComments: options.sourceComments,

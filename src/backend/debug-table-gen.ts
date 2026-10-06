@@ -274,6 +274,81 @@ export interface DebugLeaf {
   retain?: true;
 }
 
+/**
+ * Statement-probe capacity. Must equal `PLC_DEBUG_MAX_INSTRUCTIONS` in
+ * `runtime/plc/include/plc_runtime/plc_debug_probe.h`. The main-repo script
+ * `tests/studio/test_debug_limits_lockstep.sh` fails the build if they differ.
+ */
+export const PLC_DEBUG_MAX_INSTRUCTIONS = 4096;
+
+/** Reserved. Allocated statement ids start at {@link PLC_DEBUG_INSTR_ID_FIRST}. */
+export const PLC_DEBUG_INSTR_ID_NONE = 0;
+
+export const PLC_DEBUG_INSTR_ID_FIRST = PLC_DEBUG_INSTR_ID_NONE + 1;
+
+export interface DebugStatementEntry {
+  instructionId: number;
+  file: string;
+  line: number;
+  column: number;
+  pou_id: number;
+}
+
+export class InstructionMapError extends Error {
+  readonly file: string;
+  readonly line: number;
+  readonly column: number;
+
+  constructor(file: string, line: number, column: number, message: string) {
+    super(message);
+    this.name = "InstructionMapError";
+    this.file = file;
+    this.line = line;
+    this.column = column;
+  }
+}
+
+/** Next id, or throw. Never wraps to {@link PLC_DEBUG_INSTR_ID_NONE}. */
+export function claimInstructionId(
+  nextId: number,
+  at: { file: string; line: number; column: number },
+): number {
+  if (
+    !Number.isInteger(nextId) ||
+    nextId < PLC_DEBUG_INSTR_ID_FIRST ||
+    nextId >= PLC_DEBUG_MAX_INSTRUCTIONS
+  ) {
+    throw new InstructionMapError(
+      at.file,
+      at.line,
+      at.column,
+      "instruction id exhausted",
+    );
+  }
+  return nextId;
+}
+
+/**
+ * Reject a map that wrapped, skipped, or pointed a statement at a missing POU.
+ * Returns the error text, or undefined when the table is usable.
+ */
+export function debugStatementMapError(
+  pous: readonly string[],
+  statements: readonly DebugStatementEntry[],
+): string | undefined {
+  let expect = PLC_DEBUG_INSTR_ID_FIRST;
+  for (const stmt of statements) {
+    if (stmt.instructionId !== expect) {
+      return `${stmt.file}:${stmt.line}:${stmt.column}: error: instruction id ${stmt.instructionId} is not sequential`;
+    }
+    if (stmt.pou_id < PLC_DEBUG_INSTR_ID_NONE || stmt.pou_id >= pous.length) {
+      return `${stmt.file}:${stmt.line}:${stmt.column}: error: pou_id ${stmt.pou_id} is not in pous`;
+    }
+    expect += PLC_DEBUG_INSTR_ID_FIRST;
+  }
+  return undefined;
+}
+
 export interface DebugMapV2 {
   version: 2;
   md5: string;
@@ -309,6 +384,17 @@ export interface DebugMapV2 {
    * discard retained state on every unrelated edit.
    */
   retainLayoutHash?: string;
+  /**
+   * POU names in first-appearance order inside the compilation unit. The index
+   * is `pou_id`. Omitted on a production compile (no statement probes).
+   */
+  pous?: string[];
+  /**
+   * Executable statements in allocation order. `instructionId` starts at
+   * {@link PLC_DEBUG_INSTR_ID_FIRST} and stays below
+   * {@link PLC_DEBUG_MAX_INSTRUCTIONS}. Omitted when probes are off.
+   */
+  statements?: DebugStatementEntry[];
 }
 
 export interface DebugTableResult {

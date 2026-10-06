@@ -22,7 +22,9 @@ import { DuplicateSymbolError, SymbolTables } from "./semantic/symbol-table.js";
 import { SemanticAnalyzer } from "./semantic/analyzer.js";
 import { CodeGenerator } from "./backend/codegen.js";
 import {
+  debugStatementMapError,
   generateDebugTable,
+  InstructionMapError,
   type DebugMapV2,
 } from "./backend/debug-table-gen.js";
 import { StdFunctionRegistry } from "./semantic/std-function-registry.js";
@@ -815,6 +817,7 @@ export function compile(
     ...(pipeline.mergedOptions.emitChunkMarkers
       ? { emitChunkMarkers: true }
       : {}),
+    emitDebugProbes: pipeline.mergedOptions.emitDebugProbes === true,
   });
   codegen.setProjectModel(pipeline.projectModel!);
 
@@ -839,7 +842,32 @@ export function compile(
     codegen.addLibraryChunks(archive, reachable);
   }
 
-  const codeResult = codegen.generate(pipeline.ast);
+  let codeResult;
+  try {
+    codeResult = codegen.generate(pipeline.ast);
+  } catch (e) {
+    if (e instanceof InstructionMapError) {
+      return {
+        success: false,
+        cppFiles: [],
+        cppCode: "",
+        headerCode: "",
+        lineMap: new Map(),
+        headerLineMap: new Map(),
+        errors: [
+          {
+            message: e.message,
+            line: e.line,
+            column: e.column,
+            severity: "error",
+            ...(e.file ? { file: e.file } : {}),
+          },
+        ],
+        warnings: pipeline.warnings,
+      };
+    }
+    throw e;
+  }
 
   // Collect codegen warnings
   for (const warn of codeResult.warnings) {
@@ -900,6 +928,34 @@ export function compile(
         severity: "warning",
       });
     }
+  }
+
+  if (pipeline.mergedOptions.emitDebugProbes === true) {
+    const mapError = debugStatementMapError(
+      codeResult.debugPous,
+      codeResult.debugStatements,
+    );
+    if (mapError !== undefined || debugMap === undefined) {
+      return {
+        success: false,
+        cppFiles: [],
+        cppCode: "",
+        headerCode: "",
+        lineMap: new Map(),
+        headerLineMap: new Map(),
+        errors: [
+          {
+            message: mapError ?? "emit_debug_probes requires a debug map",
+            line: 0,
+            column: 0,
+            severity: "error",
+          },
+        ],
+        warnings: pipeline.warnings,
+      };
+    }
+    debugMap.pous = codeResult.debugPous;
+    debugMap.statements = codeResult.debugStatements;
   }
 
   return {
