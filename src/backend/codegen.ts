@@ -37,6 +37,7 @@ import {
   claimInstructionId,
   InstructionMapError,
   PLC_DEBUG_INSTR_ID_FIRST,
+  PLC_DEBUG_INSTR_ID_NONE,
   type DebugStatementEntry,
 } from "./debug-table-gen.js";
 import type { SymbolTables } from "../semantic/symbol-table.js";
@@ -1101,6 +1102,28 @@ export class CodeGenerator {
       this.emit(
         'extern "C" void plc_debug_probe(std::uint32_t instruction_id);',
       );
+      this.emit(
+        'extern "C" void plc_debug_frame_enter(std::uint32_t pou_id, std::uint32_t instruction_id);',
+      );
+      this.emit('extern "C" void plc_debug_frame_leave(void);');
+      /* One definition when every TU is concatenated into generated.cpp. */
+      this.emit("#ifndef UC_PLC_DEBUG_FRAME_GUARD");
+      this.emit("#define UC_PLC_DEBUG_FRAME_GUARD");
+      this.emit("namespace {");
+      this.emit("struct UcPlcDebugFrame {");
+      this.emit(
+        "    explicit UcPlcDebugFrame(std::uint32_t pou_id, std::uint32_t instruction_id) {",
+      );
+      this.emit("        ::plc_debug_frame_enter(pou_id, instruction_id);");
+      this.emit("    }");
+      this.emit("    ~UcPlcDebugFrame() { ::plc_debug_frame_leave(); }");
+      this.emit("    UcPlcDebugFrame(const UcPlcDebugFrame &) = delete;");
+      this.emit(
+        "    UcPlcDebugFrame &operator=(const UcPlcDebugFrame &) = delete;",
+      );
+      this.emit("};");
+      this.emit("}");
+      this.emit("#endif");
     }
     this.emit("");
     this.emit(`namespace ${ns} {`);
@@ -1364,6 +1387,31 @@ export class CodeGenerator {
       pou_id: this.currentPouId,
     });
     this.emit(`${indent}::plc_debug_probe(${instructionId}u);`);
+  }
+
+  /**
+   * Instruction id the first real statement in this body will claim.
+   * Empty bodies and assert-only bodies stay PLC_DEBUG_INSTR_ID_NONE so a
+   * later POU does not share this number.
+   */
+  private frameInstructionId(body: Statement[]): number {
+    for (const stmt of body) {
+      if (stmt.kind !== "AssertCall") {
+        return this.nextInstructionId;
+      }
+    }
+    return PLC_DEBUG_INSTR_ID_NONE;
+  }
+
+  /** Engineering builds only. Production compiles never emit the symbol. */
+  private emitDebugFrameGuard(body: Statement[]): void {
+    if (!this.options.emitDebugProbes || this.currentPouId === undefined) {
+      return;
+    }
+    const instructionId = this.frameInstructionId(body);
+    this.emit(
+      `    UcPlcDebugFrame uc_plc_debug_frame{${this.currentPouId}u, ${instructionId}u};`,
+    );
   }
 
   /**
@@ -2289,6 +2337,7 @@ export class CodeGenerator {
     this.emitLineDirective(method.sourceSpan.startLine);
     const implLine = this.currentLine;
     this.emit(`${returnType} ${className}::${method.name}(${params}) {`);
+    this.emitDebugFrameGuard(method.body);
 
     // Declare return variable if method has return type
     if (method.returnType) {
@@ -2374,6 +2423,7 @@ export class CodeGenerator {
       this.emitLineDirective(prop.sourceSpan.startLine);
       const getterLine = this.currentLine;
       this.emit(`${type} ${className}::get_${prop.name}() const {`);
+      this.emitDebugFrameGuard(prop.getter);
       this.emit(`    ${type} ${prop.name}_result;`);
       this.currentFunctionName = prop.name;
       this.generateStatements(prop.getter);
@@ -2389,6 +2439,7 @@ export class CodeGenerator {
       this.emitLineDirective(prop.sourceSpan.startLine);
       const setterLine = this.currentLine;
       this.emit(`void ${className}::set_${prop.name}(${type} ${prop.name}) {`);
+      this.emitDebugFrameGuard(prop.setter);
       // In setter, prop.name refers to the input parameter (no redirection)
       this.generateStatements(prop.setter);
       this.emit("}");
@@ -2431,6 +2482,7 @@ export class CodeGenerator {
 
     // Run method
     this.emit(`void Program_${prog.name}::run() {`);
+    this.emitDebugFrameGuard(prog.body);
     this.enterScope(prog.varBlocks);
     if (prog.body.length > 0) {
       // Generate statements (Phase 2.8: only ExternalCodePragma; Phase 3+: all statements)
@@ -2521,6 +2573,7 @@ export class CodeGenerator {
     if (this.options.isTestBuild) {
       this.emit("    if (__mocked_) { __mock_state_.call_count++; return; }");
     }
+    this.emitDebugFrameGuard(fb.body);
     this.enterScope(fb.varBlocks);
     if (fb.body.length > 0) {
       this.generateStatements(fb.body);
@@ -2568,6 +2621,7 @@ export class CodeGenerator {
 
     // Helper to emit local variable declarations (VAR/VAR_TEMP) and body
     const emitFunctionBody = (funcName: string) => {
+      this.emitDebugFrameGuard(func.body);
       this.emit(`    ${retType} ${funcName}_result;`);
       this.currentFunctionName = func.name;
       this.enterScope(func.varBlocks);
@@ -2913,6 +2967,7 @@ export class CodeGenerator {
 
     // Run method
     this.emit(`void Program_${prog.name}::run() {`);
+    this.emitDebugFrameGuard(astProg ? astProg.body : []);
     // VAR_EXTERNAL names for this program: body access to these is rewritten to
     // go through the GlobalVar pointer (g->read()/write()/with_lock).
     this.programExternals = new Set(

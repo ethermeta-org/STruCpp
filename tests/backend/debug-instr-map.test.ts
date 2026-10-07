@@ -43,6 +43,7 @@ describe("instruction line map", () => {
     const result = compile(SAMPLE, { emitDebugProbes: false });
     expect(result.success).toBe(true);
     expect(result.cppCode).not.toContain("plc_debug_probe");
+    expect(result.cppCode).not.toContain("plc_debug_frame_enter");
     expect(result.debugMap?.statements).toBeUndefined();
     expect(result.debugMap?.pous).toBeUndefined();
     expect(result.debugMap?.leaves.length).toBeGreaterThan(0);
@@ -72,6 +73,11 @@ describe("instruction line map", () => {
     // SAMPLE: leading newline, so these are the source lines of assign / IF / call / RETURN.
     expect(callee[0]?.line).toBe(6);
     expect(main.map((s) => s.line)).toEqual([14, 15, 16, 18]);
+    expect(result.cppCode).toContain("#ifndef UC_PLC_DEBUG_FRAME_GUARD");
+    expect(result.cppCode).toContain("plc_debug_frame_enter");
+    expect(result.cppCode).toContain("plc_debug_frame_leave");
+    expect(result.cppCode).toContain("uc_plc_debug_frame{1u, 1u}");
+    expect(result.cppCode).toContain("uc_plc_debug_frame{0u, 5u}");
   });
 
   it("fails the compile when the instruction id space is exhausted", () => {
