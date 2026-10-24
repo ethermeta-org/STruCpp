@@ -189,10 +189,18 @@ export interface InterfaceDeclaration extends ASTNode {
   name: string;
   extends?: string[];
   methods: MethodDeclaration[];
+  /**
+   * Statement-free property declarations. The access direction is which
+   * accessors the interface text carries: neither → read-write, only
+   * `getter` → read-only, only `setter` → write-only.
+   */
+  properties: PropertyDeclaration[];
 }
 
 /**
- * PROPERTY declaration within a Function Block
+ * PROPERTY declaration within a Function Block (with accessor statements)
+ * or within an INTERFACE (accessor statements forbidden; presence of the
+ * accessor alone declares the direction)
  */
 export interface PropertyDeclaration extends ASTNode {
   kind: "PropertyDeclaration";

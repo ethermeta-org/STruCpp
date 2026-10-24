@@ -20,6 +20,7 @@ import type {
   LiteralExpression,
   MethodDeclaration,
   MockFunctionStatement,
+  PropertyDeclaration,
   TypeDeclaration,
   TypeDefinition,
   TypeReference,
@@ -46,6 +47,9 @@ import {
   resolveArrayShapeByName,
   arrayDimSize,
   arrayTotalSize,
+  propertyTypesEqual,
+  formatPropertyType,
+  interfaceClosureClashes,
   type ArrayShape,
   type EnumMemberEntry,
 } from "./type-utils.js";
@@ -1762,14 +1766,90 @@ export class SemanticAnalyzer {
       fbMap.set(fb.name.toUpperCase(), fb);
     }
 
-    // Build interface lookup map
+    // Build interface lookup map: an interface's required methods are its
+    // own plus everything inherited through its EXTENDS chain — implementing
+    // a derived interface obligates the parent's methods too. Interface
+    // properties are collected the same way, nearest declaration winning.
     const ifaceMap = new Map<string, Set<string>>();
+    const ifacePropMap = new Map<string, Map<string, PropertyDeclaration>>();
+    const ifaceByName = new Map(
+      ast.interfaces.map((i) => [i.name.toUpperCase(), i]),
+    );
     for (const iface of ast.interfaces) {
+      // CODESYS interface properties carry no executable logic. The grammar
+      // tolerates accessor statements so the error can point at the source,
+      // but a specification interface with a body never compiles.
+      for (const prop of iface.properties) {
+        if (prop.getter && prop.getter.length > 0) {
+          this.addError(
+            `PROPERTY '${prop.name}' in INTERFACE '${iface.name}' cannot contain statements in its GET accessor; interface properties have no body.`,
+            prop.sourceSpan.startLine,
+            prop.sourceSpan.startCol,
+            prop.sourceSpan.file,
+          );
+        }
+        if (prop.setter && prop.setter.length > 0) {
+          this.addError(
+            `PROPERTY '${prop.name}' in INTERFACE '${iface.name}' cannot contain statements in its SET accessor; interface properties have no body.`,
+            prop.sourceSpan.startLine,
+            prop.sourceSpan.startCol,
+            prop.sourceSpan.file,
+          );
+        }
+      }
+
+      // A method and a property cannot share a name. Two properties of the
+      // same name in this EXTENDS closure must agree on type and Get/Set
+      // direction; the later declaration is not dropped.
+      for (const clash of interfaceClosureClashes(ast, iface.name)) {
+        const localProp = iface.properties.find(
+          (p) => p.name.toUpperCase() === clash.name,
+        );
+        const localMethod = iface.methods.find(
+          (m) => m.name.toUpperCase() === clash.name,
+        );
+        const span =
+          localProp?.sourceSpan ?? localMethod?.sourceSpan ?? iface.sourceSpan;
+        if (clash.kind === "method-property") {
+          this.addError(
+            `INTERFACE '${iface.name}' cannot declare both a method and a property named '${clash.name}'.`,
+            span.startLine,
+            span.startCol,
+            span.file,
+          );
+        } else {
+          this.addError(
+            `INTERFACE '${iface.name}' has property '${clash.name}' more than once in its EXTENDS closure with a different type or access direction (${clash.detail}).`,
+            span.startLine,
+            span.startCol,
+            span.file,
+          );
+        }
+      }
+
       const methodNames = new Set<string>();
-      for (const m of iface.methods) {
-        methodNames.add(m.name.toUpperCase());
+      const propByName = new Map<string, PropertyDeclaration>();
+      const visited = new Set<string>();
+      const queue = [iface.name.toUpperCase()];
+      while (queue.length > 0) {
+        const name = queue.shift()!;
+        if (visited.has(name)) continue;
+        visited.add(name);
+        const it = ifaceByName.get(name);
+        if (!it) continue;
+        for (const m of it.methods) {
+          methodNames.add(m.name.toUpperCase());
+        }
+        for (const p of it.properties) {
+          const key = p.name.toUpperCase();
+          if (!propByName.has(key)) propByName.set(key, p);
+        }
+        for (const parent of it.extends ?? []) {
+          queue.push(parent.toUpperCase());
+        }
       }
       ifaceMap.set(iface.name.toUpperCase(), methodNames);
+      ifacePropMap.set(iface.name.toUpperCase(), propByName);
     }
 
     for (const fb of ast.functionBlocks) {
@@ -1861,27 +1941,131 @@ export class SemanticAnalyzer {
         }
       }
 
-      // IMPLEMENTS contract validation: check all interface methods are provided
-      if (fb.implements && !fb.isAbstract) {
-        const fbMethodNames = new Set<string>();
-        for (const m of fb.methods) {
-          fbMethodNames.add(m.name.toUpperCase());
-        }
-        // Include inherited methods
-        for (const name of parentMethods.keys()) {
-          fbMethodNames.add(name);
+      // IMPLEMENTS contract. An ABSTRACT block skips the check; a concrete
+      // block must satisfy its own IMPLEMENTS and every ancestor's. Only a
+      // PUBLIC method or property counts — PRIVATE and PROTECTED do not
+      // implement the interface. The nearest declaration on the EXTENDS
+      // chain is the one that is judged.
+      if (!fb.isAbstract) {
+        const requiredIfaces: string[] = [];
+        const seenIface = new Set<string>();
+        const ownIfaces = new Set(
+          (fb.implements ?? []).map((name) => name.toUpperCase()),
+        );
+        {
+          let cur: FunctionBlockDeclaration | undefined = fb;
+          const seenFb = new Set<string>();
+          while (cur) {
+            const upper = cur.name.toUpperCase();
+            if (seenFb.has(upper)) break;
+            seenFb.add(upper);
+            for (const name of cur.implements ?? []) {
+              const key = name.toUpperCase();
+              if (seenIface.has(key)) continue;
+              seenIface.add(key);
+              requiredIfaces.push(name);
+            }
+            cur = cur.extends
+              ? fbMap.get(cur.extends.toUpperCase())
+              : undefined;
+          }
         }
 
-        for (const ifaceName of fb.implements) {
+        const fbMethods = new Map<string, MethodDeclaration>();
+        for (const method of fb.methods) {
+          const key = method.name.toUpperCase();
+          if (!fbMethods.has(key)) fbMethods.set(key, method);
+        }
+        for (const [name, method] of parentMethods) {
+          if (!fbMethods.has(name)) fbMethods.set(name, method);
+        }
+
+        const fbProps = new Map<string, PropertyDeclaration>();
+        const considerProps = (props: PropertyDeclaration[]) => {
+          for (const prop of props) {
+            const key = prop.name.toUpperCase();
+            if (!fbProps.has(key)) fbProps.set(key, prop);
+          }
+        };
+        considerProps(fb.properties);
+        {
+          let cur = fb.extends;
+          const seen = new Set<string>();
+          while (cur) {
+            const upper = cur.toUpperCase();
+            if (seen.has(upper)) break;
+            seen.add(upper);
+            const parent = fbMap.get(upper);
+            if (!parent) break;
+            considerProps(parent.properties);
+            cur = parent.extends;
+          }
+        }
+
+        for (const ifaceName of requiredIfaces) {
+          const inherited = !ownIfaces.has(ifaceName.toUpperCase())
+            ? " (inherited contract)"
+            : "";
           const requiredMethods = ifaceMap.get(ifaceName.toUpperCase());
           if (requiredMethods) {
             for (const reqMethod of requiredMethods) {
-              if (!fbMethodNames.has(reqMethod)) {
+              const provided = fbMethods.get(reqMethod);
+              if (!provided || provided.visibility !== "PUBLIC") {
                 this.addError(
-                  `FUNCTION_BLOCK '${fb.name}' implements '${ifaceName}' but does not provide method '${reqMethod}'.`,
+                  `FUNCTION_BLOCK '${fb.name}' implements '${ifaceName}'${inherited} but does not provide method '${reqMethod}'.`,
                   fb.sourceSpan.startLine,
                   fb.sourceSpan.startCol,
                   fb.sourceSpan.file,
+                );
+              }
+            }
+          }
+
+          // Property contract: name, type (including string length and array
+          // bounds), and access direction. Direction comes from the interface
+          // text alone — no accessors means the implementation needs both GET
+          // and SET (CODESYS read-write default), a lone GET means read-only,
+          // a lone SET write-only.
+          const requiredProps = ifacePropMap.get(ifaceName.toUpperCase());
+          if (requiredProps) {
+            for (const reqProp of requiredProps.values()) {
+              const provided = fbProps.get(reqProp.name.toUpperCase());
+              if (!provided || provided.visibility !== "PUBLIC") {
+                this.addError(
+                  `FUNCTION_BLOCK '${fb.name}' implements '${ifaceName}'${inherited} but does not provide property '${reqProp.name}'.`,
+                  fb.sourceSpan.startLine,
+                  fb.sourceSpan.startCol,
+                  fb.sourceSpan.file,
+                );
+                continue;
+              }
+              if (!propertyTypesEqual(provided.type, reqProp.type)) {
+                this.addError(
+                  `FUNCTION_BLOCK '${fb.name}' implements '${ifaceName}'${inherited} but property '${reqProp.name}' has type '${formatPropertyType(provided.type)}' while the interface declares '${formatPropertyType(reqProp.type)}'.`,
+                  provided.sourceSpan.startLine,
+                  provided.sourceSpan.startCol,
+                  provided.sourceSpan.file,
+                );
+                continue;
+              }
+              const needsGet =
+                reqProp.setter === undefined || reqProp.getter !== undefined;
+              const needsSet =
+                reqProp.getter === undefined || reqProp.setter !== undefined;
+              if (needsGet && provided.getter === undefined) {
+                this.addError(
+                  `FUNCTION_BLOCK '${fb.name}' implements '${ifaceName}'${inherited} but property '${reqProp.name}' is missing a GET accessor.`,
+                  provided.sourceSpan.startLine,
+                  provided.sourceSpan.startCol,
+                  provided.sourceSpan.file,
+                );
+              }
+              if (needsSet && provided.setter === undefined) {
+                this.addError(
+                  `FUNCTION_BLOCK '${fb.name}' implements '${ifaceName}'${inherited} but property '${reqProp.name}' is missing a SET accessor.`,
+                  provided.sourceSpan.startLine,
+                  provided.sourceSpan.startCol,
+                  provided.sourceSpan.file,
                 );
               }
             }
@@ -3259,6 +3443,12 @@ export class SemanticAnalyzer {
         validateVarBlocks(
           method.varBlocks,
           `METHOD '${method.name}' of INTERFACE '${iface.name}'`,
+        );
+      }
+      for (const prop of iface.properties) {
+        this.validateSingleTypeReference(
+          prop.type,
+          `PROPERTY '${prop.name}' of INTERFACE '${iface.name}'`,
         );
       }
     }

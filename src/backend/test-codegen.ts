@@ -79,18 +79,13 @@ export class TestCodeGenerator extends CodeGenerator {
           method.name,
         );
       }
-      for (const prop of fb.properties) {
-        this.propertyNameMap.set(
-          `${fb.name.toUpperCase()}.${prop.name.toUpperCase()}`,
-          prop.name,
-        );
-      }
       // Precompute interface method names for field access mangling
       const ifaceMethods = this.getInterfaceMethodNames(fb);
       if (ifaceMethods.size > 0) {
         this.fbInterfaceMethodNames.set(fb.name.toUpperCase(), ifaceMethods);
       }
     }
+    this.registerFbPropertyNames(ast);
     const enumDescriptors: Array<{ name: string; members: string[] }> = [];
     for (const td of ast.types) {
       this.knownStructTypes.add(td.name.toUpperCase());

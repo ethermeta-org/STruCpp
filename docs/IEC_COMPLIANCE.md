@@ -4,164 +4,168 @@ STruC++ implements the Structured Text (ST) language from IEC 61131-3. This docu
 
 ## Data Types
 
-| Type | Status | Notes |
-|------|--------|-------|
-| BOOL | Supported | |
-| BYTE, WORD, DWORD, LWORD | Supported | |
-| SINT, INT, DINT, LINT | Supported | |
-| USINT, UINT, UDINT, ULINT | Supported | |
-| REAL, LREAL | Supported | |
-| TIME | Supported | Nanosecond precision, int64_t storage |
-| DATE | Supported | |
-| TIME_OF_DAY | Supported | |
-| DATE_AND_TIME | Supported | |
-| LTIME, LDATE, LTOD, LDT | Supported | 64-bit time types with nanosecond precision |
-| STRING | Supported | Parameterized length: STRING(N), default 254 |
-| WSTRING | Supported | Parameterized length: WSTRING(N) |
-| CHAR, WCHAR | Supported | |
+| Type                      | Status    | Notes                                        |
+| ------------------------- | --------- | -------------------------------------------- |
+| BOOL                      | Supported |                                              |
+| BYTE, WORD, DWORD, LWORD  | Supported |                                              |
+| SINT, INT, DINT, LINT     | Supported |                                              |
+| USINT, UINT, UDINT, ULINT | Supported |                                              |
+| REAL, LREAL               | Supported |                                              |
+| TIME                      | Supported | Nanosecond precision, int64_t storage        |
+| DATE                      | Supported |                                              |
+| TIME_OF_DAY               | Supported |                                              |
+| DATE_AND_TIME             | Supported |                                              |
+| LTIME, LDATE, LTOD, LDT   | Supported | 64-bit time types with nanosecond precision  |
+| STRING                    | Supported | Parameterized length: STRING(N), default 254 |
+| WSTRING                   | Supported | Parameterized length: WSTRING(N)             |
+| CHAR, WCHAR               | Supported |                                              |
 
 ### Derived Types
 
-| Type | Status | Notes |
-|------|--------|-------|
-| TYPE ... END_TYPE | Supported | Type aliases |
-| STRUCT ... END_STRUCT | Supported | With nested structs |
-| Enumerations | Supported | With optional base type |
+| Type                          | Status    | Notes                                                                                                                                                              |
+| ----------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| TYPE ... END_TYPE             | Supported | Type aliases                                                                                                                                                       |
+| STRUCT ... END_STRUCT         | Supported | With nested structs                                                                                                                                                |
+| Enumerations                  | Supported | With optional base type                                                                                                                                            |
 | Initialized type declarations | Supported | A type may carry its own default (`Setpoint : REAL := 25.0;`, `Origin : Point := (x := 0.0);`), inherited by every declaration of the type that has no initializer |
-| ARRAY (1D) | Supported | Arbitrary bounds: ARRAY[1..10] OF INT |
-| ARRAY (2D) | Supported | ARRAY[1..3, 1..4] OF REAL |
-| ARRAY (3D) | Supported | ARRAY[1..3, 1..4, 1..5] OF INT |
-| ARRAY OF function block | Supported | Declaration, member access, and element invocation (`units[i](step := 1.0)`). A *method* call on an element (`units[0].M()`) is not yet parsed |
-| ARRAY[*] (VLA) | Supported | Variable-length array parameters |
-| Subranges | Supported | Runtime validation |
-| REF_TO | Supported | IEC reference type (explicit dereference) |
-| REFERENCE_TO | Supported | CODESYS reference type (implicit dereference) |
-| POINTER TO | Supported | CODESYS pointer type with dereference via ^ |
+| ARRAY (1D)                    | Supported | Arbitrary bounds: ARRAY[1..10] OF INT                                                                                                                              |
+| ARRAY (2D)                    | Supported | ARRAY[1..3, 1..4] OF REAL                                                                                                                                          |
+| ARRAY (3D)                    | Supported | ARRAY[1..3, 1..4, 1..5] OF INT                                                                                                                                     |
+| ARRAY OF function block       | Supported | Declaration, member access, and element invocation (`units[i](step := 1.0)`). A _method_ call on an element (`units[0].M()`) is not yet parsed                     |
+| ARRAY[*] (VLA)                | Supported | Variable-length array parameters                                                                                                                                   |
+| Subranges                     | Supported | Runtime validation                                                                                                                                                 |
+| REF_TO                        | Supported | IEC reference type (explicit dereference)                                                                                                                          |
+| REFERENCE_TO                  | Supported | CODESYS reference type (implicit dereference)                                                                                                                      |
+| POINTER TO                    | Supported | CODESYS pointer type with dereference via ^                                                                                                                        |
 
 ### Not Implemented
 
-| Type | Notes |
-|------|-------|
+| Type  | Notes             |
+| ----- | ----------------- |
 | UNION | CODESYS extension |
 
 ## Program Organization Units
 
-| POU | Status | Notes |
-|-----|--------|-------|
-| PROGRAM | Supported | With CONFIGURATION/RESOURCE/TASK structure |
-| FUNCTION | Supported | With return type, all parameter modes |
-| FUNCTION_BLOCK | Supported | Instantiation, invocation, member access |
-| INTERFACE | Supported | Method and property signatures |
+| POU            | Status    | Notes                                      |
+| -------------- | --------- | ------------------------------------------ |
+| PROGRAM        | Supported | With CONFIGURATION/RESOURCE/TASK structure |
+| FUNCTION       | Supported | With return type, all parameter modes      |
+| FUNCTION_BLOCK | Supported | Instantiation, invocation, member access   |
+| INTERFACE      | Supported | Method and property signatures             |
 
 ## Variable Declarations
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| VAR | Supported | Local variables |
-| VAR_INPUT | Supported | Input parameters |
-| VAR_OUTPUT | Supported | Output parameters |
-| VAR_IN_OUT | Supported | Pass-by-reference parameters |
-| VAR_EXTERNAL | Supported | References either a CONFIGURATION or a file-level VAR_GLOBAL |
-| VAR_GLOBAL | Supported | Global variables (CONFIGURATION-scoped or file-level) |
-| CONSTANT | Supported | Compile-time constants |
-| RETAIN | Supported | Allowed on `VAR`, `VAR_INPUT`, `VAR_OUTPUT` and `VAR_GLOBAL`, per IEC 61131-3. Rejected on `VAR_IN_OUT` / `VAR_TEMP` / `VAR_EXTERNAL`, and inside a `FUNCTION` or `METHOD` (no instance, nothing to retain) |
-| PERSISTENT | Partial | Accepted and treated as `RETAIN`. CODESYS also keeps a PERSISTENT value across a program download; that is not implemented, so the weaker shared guarantee is what is claimed |
-| NON_RETAIN | Supported | Accepted and treated as the default (a plain `VAR` is already non-retained). Rejected when combined with `RETAIN` or `CONSTANT` |
-| AT %IX0.0 | Supported | Located variables (I/Q/M areas, X/B/W/D/L sizes) |
-| Multiple names | Supported | `a, b, c : INT := 0;` |
-| Initialization | Supported | `:= expression` |
-| Array initialization | Supported | `:= [1, 2, 3]` and the bracket-less `:= 1, 2, 3`. Multi-dimensional arrays take either a flat row-major list or a nested one (`:= [[1, 2], [3, 4]]`), where each inner list fills one row from its own bound. Nesting depth and value count are validated against the declared dimensions |
-| Array repetition | Supported | `:= [10(0)]`, `:= [3(1), 2(5)]`, `:= [7, 4(2), 9]`. The repeated value may be a structure initializer. Max count 65536 |
-| Structure initialization | Supported | `:= (x := 1.0, y := 2.0)`; nested, in array literals, and for FB instances. Omitted elements keep their own declared default. Only valid as a declaration's initial value, as in the standard — one written inside a statement is rejected |
-| STRUCT element defaults | Supported | Scalar, array-literal and structure-initializer defaults on a STRUCT element all carry their values |
+| Feature                  | Status    | Notes                                                                                                                                                                                                                                                                                     |
+| ------------------------ | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| VAR                      | Supported | Local variables                                                                                                                                                                                                                                                                           |
+| VAR_INPUT                | Supported | Input parameters                                                                                                                                                                                                                                                                          |
+| VAR_OUTPUT               | Supported | Output parameters                                                                                                                                                                                                                                                                         |
+| VAR_IN_OUT               | Supported | Pass-by-reference parameters                                                                                                                                                                                                                                                              |
+| VAR_EXTERNAL             | Supported | References either a CONFIGURATION or a file-level VAR_GLOBAL                                                                                                                                                                                                                              |
+| VAR_GLOBAL               | Supported | Global variables (CONFIGURATION-scoped or file-level)                                                                                                                                                                                                                                     |
+| CONSTANT                 | Supported | Compile-time constants                                                                                                                                                                                                                                                                    |
+| RETAIN                   | Supported | Allowed on `VAR`, `VAR_INPUT`, `VAR_OUTPUT` and `VAR_GLOBAL`, per IEC 61131-3. Rejected on `VAR_IN_OUT` / `VAR_TEMP` / `VAR_EXTERNAL`, and inside a `FUNCTION` or `METHOD` (no instance, nothing to retain)                                                                               |
+| PERSISTENT               | Partial   | Accepted and treated as `RETAIN`. CODESYS also keeps a PERSISTENT value across a program download; that is not implemented, so the weaker shared guarantee is what is claimed                                                                                                             |
+| NON_RETAIN               | Supported | Accepted and treated as the default (a plain `VAR` is already non-retained). Rejected when combined with `RETAIN` or `CONSTANT`                                                                                                                                                           |
+| AT %IX0.0                | Supported | Located variables (I/Q/M areas, X/B/W/D/L sizes)                                                                                                                                                                                                                                          |
+| Multiple names           | Supported | `a, b, c : INT := 0;`                                                                                                                                                                                                                                                                     |
+| Initialization           | Supported | `:= expression`                                                                                                                                                                                                                                                                           |
+| Array initialization     | Supported | `:= [1, 2, 3]` and the bracket-less `:= 1, 2, 3`. Multi-dimensional arrays take either a flat row-major list or a nested one (`:= [[1, 2], [3, 4]]`), where each inner list fills one row from its own bound. Nesting depth and value count are validated against the declared dimensions |
+| Array repetition         | Supported | `:= [10(0)]`, `:= [3(1), 2(5)]`, `:= [7, 4(2), 9]`. The repeated value may be a structure initializer. Max count 65536                                                                                                                                                                    |
+| Structure initialization | Supported | `:= (x := 1.0, y := 2.0)`; nested, in array literals, and for FB instances. Omitted elements keep their own declared default. Only valid as a declaration's initial value, as in the standard — one written inside a statement is rejected                                                |
+| STRUCT element defaults  | Supported | Scalar, array-literal and structure-initializer defaults on a STRUCT element all carry their values                                                                                                                                                                                       |
 
 ### Initialization gaps
 
-| Form | Notes |
-|------|-------|
+| Form                     | Notes                                                                                                                                                       |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Repetition with no value | `:= [10()]` (ten copies of the element default) — write `:= [10(0)]`, or omit the elements entirely. Matches matiec and CODESYS, which also require a value |
 
 ## Operators and Expressions
 
-| Category | Operators | Status |
-|----------|-----------|--------|
-| Arithmetic | `+`, `-`, `*`, `/`, `MOD`, `**` | Supported |
-| Comparison | `=`, `<>`, `<`, `>`, `<=`, `>=` | Supported |
-| Logical | `AND`, `OR`, `XOR`, `NOT` | Supported |
-| Bitwise | `AND`, `OR`, `XOR`, `NOT` (on bit types) | Supported |
-| Bit shift | `SHL`, `SHR`, `ROL`, `ROR` | Supported |
-| Assignment | `:=` | Supported |
-| Reference assign | `REF=` | Supported |
-| Dereference | `^`, `DREF()` | Supported |
-| Reference | `REF()` | Supported |
-| Parentheses | `( )` | Supported |
-| Function call | `name(args)` | Supported (positional + named) |
-| Method call | `obj.method(args)` | Supported |
-| Array access | `arr[i]`, `arr[i, j]` | Supported — the index count is validated against the declared rank |
-| Field access | `struct.field` | Supported |
-| Typed literals | `INT#5`, `DINT#42`, `REAL#3.14` | Supported |
-| Integer literals | `9223372036854775807`, `16#FF`, `1_000` | Supported — the full 64-bit LINT/ULINT range is preserved exactly; a value wider than ULINT is rejected |
-| NEW | `__NEW(type)`, `__NEW(type, size)` | Supported |
-| DELETE | `__DELETE(ptr)` | Supported |
+| Category         | Operators                                | Status                                                                                                  |
+| ---------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| Arithmetic       | `+`, `-`, `*`, `/`, `MOD`, `**`          | Supported                                                                                               |
+| Comparison       | `=`, `<>`, `<`, `>`, `<=`, `>=`          | Supported                                                                                               |
+| Logical          | `AND`, `OR`, `XOR`, `NOT`                | Supported                                                                                               |
+| Bitwise          | `AND`, `OR`, `XOR`, `NOT` (on bit types) | Supported                                                                                               |
+| Bit shift        | `SHL`, `SHR`, `ROL`, `ROR`               | Supported                                                                                               |
+| Assignment       | `:=`                                     | Supported                                                                                               |
+| Reference assign | `REF=`                                   | Supported                                                                                               |
+| Dereference      | `^`, `DREF()`                            | Supported                                                                                               |
+| Reference        | `REF()`                                  | Supported                                                                                               |
+| Parentheses      | `( )`                                    | Supported                                                                                               |
+| Function call    | `name(args)`                             | Supported (positional + named)                                                                          |
+| Method call      | `obj.method(args)`                       | Supported                                                                                               |
+| Array access     | `arr[i]`, `arr[i, j]`                    | Supported — the index count is validated against the declared rank                                      |
+| Field access     | `struct.field`                           | Supported                                                                                               |
+| Typed literals   | `INT#5`, `DINT#42`, `REAL#3.14`          | Supported                                                                                               |
+| Integer literals | `9223372036854775807`, `16#FF`, `1_000`  | Supported — the full 64-bit LINT/ULINT range is preserved exactly; a value wider than ULINT is rejected |
+| NEW              | `__NEW(type)`, `__NEW(type, size)`       | Supported                                                                                               |
+| DELETE           | `__DELETE(ptr)`                          | Supported                                                                                               |
 
 ## Control Structures
 
-| Structure | Status | Notes |
-|-----------|--------|-------|
-| IF / ELSIF / ELSE / END_IF | Supported | |
-| FOR / TO / BY / DO / END_FOR | Supported | With optional BY (step) |
-| WHILE / DO / END_WHILE | Supported | |
-| REPEAT / UNTIL / END_REPEAT | Supported | |
-| CASE / OF / END_CASE | Supported | Integer, bit, and enum selectors |
-| EXIT | Supported | Break from loop |
-| RETURN | Supported | Early return from POU |
+| Structure                    | Status    | Notes                            |
+| ---------------------------- | --------- | -------------------------------- |
+| IF / ELSIF / ELSE / END_IF   | Supported |                                  |
+| FOR / TO / BY / DO / END_FOR | Supported | With optional BY (step)          |
+| WHILE / DO / END_WHILE       | Supported |                                  |
+| REPEAT / UNTIL / END_REPEAT  | Supported |                                  |
+| CASE / OF / END_CASE         | Supported | Integer, bit, and enum selectors |
+| EXIT                         | Supported | Break from loop                  |
+| RETURN                       | Supported | Early return from POU            |
 
 ## OOP Extensions
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Methods | Supported | On FUNCTION_BLOCK, with return types |
-| Properties (GET/SET) | Supported | Virtual getter/setter methods in C++ |
-| Inheritance (EXTENDS) | Supported | Single inheritance |
-| Interfaces (IMPLEMENTS) | Supported | Multiple interfaces, generates C++ abstract classes |
-| ABSTRACT | Supported | Abstract FB (no instantiation) and abstract methods (pure virtual) |
-| FINAL | Supported | Sealed FB and methods |
-| OVERRIDE | Supported | Method override with C++ override specifier |
-| PUBLIC/PRIVATE/PROTECTED | Supported | Access modifiers |
-| THIS | Supported | Self-reference in methods |
+| Feature                  | Status    | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| ------------------------ | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Methods                  | Supported | On FUNCTION_BLOCK, with return types                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Properties (GET/SET)     | Supported | Virtual getter/setter methods in C++. A property inherited through FUNCTION*BLOCK EXTENDS is reached with `get*`/`set\_` (the block's own declaration wins); it is not a field                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| Inheritance (EXTENDS)    | Supported | Single inheritance between function blocks (ordinary C++ base). Interface EXTENDS is `virtual public`, so a diamond has one shared interface base                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| Interfaces (IMPLEMENTS)  | Supported | Multiple interfaces as `virtual public` bases, generated as C++ abstract classes. Interface members are public. Only a PUBLIC method or property counts as the implementation; PRIVATE and PROTECTED do not. An ABSTRACT function block skips the check; a concrete descendant must satisfy the ancestors' IMPLEMENTS                                                                                                                                                                                                                                                                                                                                                                                                |
+| Interface variables      | Supported | Nullable references (`IEC_ITF<T>`), unbound until first assignment. `ARRAY OF`, `POINTER TO`, `REF_TO`, and `REFERENCE TO` an interface keep that wrapper around `IEC_ITF<T>`. A method that returns an interface returns `IEC_ITF<T>` by value; the call checks `get() != nullptr` and an unbound call yields an empty `IEC_ITF<T>()`                                                                                                                                                                                                                                                                                                                                                                               |
+| Interface assignment     | Supported | `itf := fb` compiles when the FB is declared in this unit and its IMPLEMENTS closure (EXTENDS chain included) contains the interface. A library function block with no declaration in this unit is left to the `bind()` template constraint. `itf1 := itf2` copies the reference. A function-block call's interface input uses the same rule                                                                                                                                                                                                                                                                                                                                                                         |
+| Interface properties     | Supported | `PROPERTY Name : Type` inside an INTERFACE, no accessor statements and no `VAR`. No accessors = read-write, an empty `GET` = read-only, an empty `SET` = write-only. A method and a property cannot share a name. Same-named properties in one EXTENDS closure must match type (string length and array bounds included) and Get/Set direction. IMPLEMENTS checks that public contract. A property whose type is an interface: Get returns `IEC_ITF<T>`, Set takes `const IEC_ITF<T>&`. On `itf.Box.Value := 1` only the last step is a write; a middle property is a read. Reads and writes through a reference dispatch to the implementation; an unbound reference reads the type's zero value and ignores writes |
+| \_\_QUERYINTERFACE       | Supported | `__QUERYINTERFACE(src, dest)` returns BOOL. Both arguments must be variables. The `dynamic_cast` and `bind` run when the expression is evaluated (every WHILE iteration, and inside one CASE arm), so a failed query unbinds dest and a successful one binds it                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ABSTRACT                 | Supported | Abstract FB (no instantiation) and abstract methods (pure virtual)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| FINAL                    | Supported | Sealed FB and methods                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| OVERRIDE                 | Supported | Method override with C++ override specifier                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| PUBLIC/PRIVATE/PROTECTED | Supported | Access modifiers                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| THIS                     | Supported | Self-reference in methods                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 
 ## Standard Functions
 
 All IEC 61131-3 standard functions are implemented in the C++ runtime:
 
-| Category | Functions |
-|----------|-----------|
-| Numeric | ABS, SQRT, LN, LOG, EXP, EXPT |
-| Trigonometric | SIN, COS, TAN, ASIN, ACOS, ATAN, ATAN2 |
-| Selection | SEL, MIN, MAX, LIMIT, MUX |
-| Comparison | GT, GE, EQ, LE, LT, NE |
-| Bitwise | AND, OR, XOR, NOT, MOVE |
-| Bit Shift | SHL, SHR, ROL, ROR |
-| Type Conversion | *_TO_* (INT_TO_REAL, DINT_TO_STRING, etc.) |
-| String | LEN, LEFT, RIGHT, MID, CONCAT, FIND, REPLACE, INSERT, DELETE, UPPER, LOWER, TRIM |
-| System | ADR, SIZEOF |
+| Category        | Functions                                                                        |
+| --------------- | -------------------------------------------------------------------------------- |
+| Numeric         | ABS, SQRT, LN, LOG, EXP, EXPT                                                    |
+| Trigonometric   | SIN, COS, TAN, ASIN, ACOS, ATAN, ATAN2                                           |
+| Selection       | SEL, MIN, MAX, LIMIT, MUX                                                        |
+| Comparison      | GT, GE, EQ, LE, LT, NE                                                           |
+| Bitwise         | AND, OR, XOR, NOT, MOVE                                                          |
+| Bit Shift       | SHL, SHR, ROL, ROR                                                               |
+| Type Conversion | _*TO*_ (INT_TO_REAL, DINT_TO_STRING, etc.)                                       |
+| String          | LEN, LEFT, RIGHT, MID, CONCAT, FIND, REPLACE, INSERT, DELETE, UPPER, LOWER, TRIM |
+| System          | ADR, SIZEOF                                                                      |
 
 ## Standard Function Blocks
 
 Bundled as a compiled `.stlib` library (`libs/iec-standard-fb.stlib`):
 
-| FB | Description |
-|----|-------------|
-| TON | On-delay timer |
-| TOF | Off-delay timer |
-| TP | Pulse timer |
-| CTU | Count-up counter |
-| CTD | Count-down counter |
-| CTUD | Up/down counter |
-| R_TRIG | Rising edge detector |
-| F_TRIG | Falling edge detector |
-| SR | Set-dominant bistable |
-| RS | Reset-dominant bistable |
+| FB     | Description             |
+| ------ | ----------------------- |
+| TON    | On-delay timer          |
+| TOF    | Off-delay timer         |
+| TP     | Pulse timer             |
+| CTU    | Count-up counter        |
+| CTD    | Count-down counter      |
+| CTUD   | Up/down counter         |
+| R_TRIG | Rising edge detector    |
+| F_TRIG | Falling edge detector   |
+| SR     | Set-dominant bistable   |
+| RS     | Reset-dominant bistable |
 
 Both counting inputs are sampled on the rising edge, as IEC 61131-3 declares them
 (`CU : BOOL R_EDGE`, `CD : BOOL R_EDGE`). A count is registered on the scan where
@@ -179,37 +183,36 @@ edges on `CU` and `CD` leave `CV` unchanged. CODESYS does not document that case
 
 ## Project Structure
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| CONFIGURATION | Supported | |
-| RESOURCE ... ON | Supported | |
-| TASK ... WITH INTERVAL | Supported | |
-| Program instances | Supported | `name : programType` with task assignment |
-| VAR_GLOBAL in configuration | Supported | |
-| Namespace configuration | Supported | Via pragmas |
+| Feature                     | Status    | Notes                                     |
+| --------------------------- | --------- | ----------------------------------------- |
+| CONFIGURATION               | Supported |                                           |
+| RESOURCE ... ON             | Supported |                                           |
+| TASK ... WITH INTERVAL      | Supported |                                           |
+| Program instances           | Supported | `name : programType` with task assignment |
+| VAR_GLOBAL in configuration | Supported |                                           |
+| Namespace configuration     | Supported | Via pragmas                               |
 
 ## Language Extensions
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Nested comments `(* (* *) *)` | Supported | Arbitrary nesting depth |
-| Pragmas `{...}` | Supported | Including `{external}` for inline C++ |
-| Inline C++ | Supported | Via `{external ...}` pragma blocks |
-| Inline function calls | Supported | Via `{call ...}` pragma |
-| Global constants (`-D`) | Supported | CLI `-D NAME=VALUE`, emits `constexpr` |
-| Dynamic memory | Supported | `__NEW(type)`, `__DELETE(ptr)` |
-| POINTER TO | Supported | Full pointer type with dereference |
-| Typed literals | Supported | `INT#5`, `DINT#42`, `REAL#3.14` |
+| Feature                       | Status    | Notes                                  |
+| ----------------------------- | --------- | -------------------------------------- |
+| Nested comments `(* (* *) *)` | Supported | Arbitrary nesting depth                |
+| Pragmas `{...}`               | Supported | Including `{external}` for inline C++  |
+| Inline C++                    | Supported | Via `{external ...}` pragma blocks     |
+| Inline function calls         | Supported | Via `{call ...}` pragma                |
+| Global constants (`-D`)       | Supported | CLI `-D NAME=VALUE`, emits `constexpr` |
+| Dynamic memory                | Supported | `__NEW(type)`, `__DELETE(ptr)`         |
+| POINTER TO                    | Supported | Full pointer type with dereference     |
+| Typed literals                | Supported | `INT#5`, `DINT#42`, `REAL#3.14`        |
 
 ## Not Yet Implemented
 
-| Feature | Notes |
-|---------|-------|
-| UNION | CODESYS union type |
-| FB_Init / FB_Exit | Constructor/destructor lifecycle methods |
-| __QUERYINTERFACE | Runtime interface query |
-| Bit access (var.%X0) | Individual bit addressing |
-| ACTION blocks | Named action blocks |
-| TRY/CATCH/FINALLY | Exception handling |
-| Generics | Parameterized types |
-| Conditional compilation | Preprocessor-style conditionals |
+| Feature                 | Notes                                    |
+| ----------------------- | ---------------------------------------- |
+| UNION                   | CODESYS union type                       |
+| FB_Init / FB_Exit       | Constructor/destructor lifecycle methods |
+| Bit access (var.%X0)    | Individual bit addressing                |
+| ACTION blocks           | Named action blocks                      |
+| TRY/CATCH/FINALLY       | Exception handling                       |
+| Generics                | Parameterized types                      |
+| Conditional compilation | Preprocessor-style conditionals          |

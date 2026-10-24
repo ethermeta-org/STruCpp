@@ -225,6 +225,328 @@ const GENERIC_TYPE_NAMES: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Spelling of the CODESYS `__QUERYINTERFACE(src, dest)` builtin. Declared
+ * here so the semantic pass and codegen agree on the name; it is a
+ * compiler builtin, not a registry std function.
+ */
+export const QUERY_INTERFACE_FN = "__QUERYINTERFACE";
+
+/** Minimal POU shape collectImplementedInterfaces needs from an AST. */
+export interface ImplementsAstSlice {
+  functionBlocks: Array<{
+    name: string;
+    extends?: string;
+    implements?: string[];
+  }>;
+  interfaces: Array<{ name: string; extends?: string[] }>;
+}
+
+/**
+ * Every interface a function block type satisfies: its own IMPLEMENTS plus
+ * the IMPLEMENTS of every FB on its EXTENDS chain, each expanded through
+ * the interfaces' own EXTENDS chains (an implementation of a derived
+ * interface also satisfies the parent interface). Names are upper-case.
+ *
+ * `undefined` when this compilation unit has no declaration of
+ * `fbTypeName`. That is a library function block: the caller must not
+ * report "does not implement". The generated `bind()` template constraint
+ * is the check. An empty set means the block is declared here and the
+ * IMPLEMENTS closure visible in this unit does not name any interface.
+ * A parent that is not declared in this unit stops the walk; only the
+ * visible closure is returned.
+ */
+export function collectImplementedInterfaces(
+  ast: ImplementsAstSlice,
+  fbTypeName: string,
+): Set<string> | undefined {
+  const fbsByUpper = new Map(
+    ast.functionBlocks.map((fb) => [fb.name.toUpperCase(), fb]),
+  );
+  const start = fbTypeName.toUpperCase();
+  if (!fbsByUpper.has(start)) return undefined;
+
+  const implemented = new Set<string>();
+  const ifacesByUpper = new Map(
+    ast.interfaces.map((iface) => [iface.name.toUpperCase(), iface]),
+  );
+
+  // Expand one interface through its EXTENDS chain.
+  const expandInterface = (ifaceName: string) => {
+    const upper = ifaceName.toUpperCase();
+    if (implemented.has(upper)) return;
+    implemented.add(upper);
+    const iface = ifacesByUpper.get(upper);
+    for (const parent of iface?.extends ?? []) {
+      expandInterface(parent);
+    }
+  };
+
+  // Walk the FB EXTENDS chain, collecting each level's IMPLEMENTS.
+  const visited = new Set<string>();
+  let current: string | undefined = start;
+  while (current && !visited.has(current)) {
+    visited.add(current);
+    const fb = fbsByUpper.get(current);
+    if (!fb) break;
+    for (const ifaceName of fb.implements ?? []) {
+      expandInterface(ifaceName);
+    }
+    current = fb.extends?.toUpperCase();
+  }
+  return implemented;
+}
+
+/**
+ * Whether `ifaceCandidateTypeName` is, or extends, `targetIfaceTypeName`
+ * (both upper-case) — i.e. a reference of the candidate type may be
+ * assigned to a variable of the target interface type.
+ */
+export function interfaceExtends(
+  ast: ImplementsAstSlice,
+  ifaceCandidateTypeName: string,
+  targetIfaceTypeName: string,
+): boolean {
+  if (ifaceCandidateTypeName === targetIfaceTypeName) return true;
+  const visited = new Set<string>();
+  const queue = [ifaceCandidateTypeName];
+  while (queue.length > 0) {
+    const name = queue.shift()!;
+    if (visited.has(name)) continue;
+    visited.add(name);
+    if (name === targetIfaceTypeName) return true;
+    const iface = ast.interfaces.find((i) => i.name.toUpperCase() === name);
+    for (const parent of iface?.extends ?? []) {
+      queue.push(parent.toUpperCase());
+    }
+  }
+  return false;
+}
+
+/** Type reference fields that distinguish one property type from another. */
+export interface PropertyTypeRef {
+  name: string;
+  maxLength?: number | string;
+  arrayDimensions?: Array<{ start: number; end: number }>;
+  elementTypeName?: string;
+  referenceKind?: string;
+}
+
+/** Minimal interface-property shape findInterfaceProperty needs. */
+export interface InterfacePropertySlice {
+  name: string;
+  type: PropertyTypeRef;
+  /** Present (possibly empty) = the interface declares the read direction. */
+  getter?: unknown;
+  /** Present (possibly empty) = the interface declares the write direction. */
+  setter?: unknown;
+}
+
+/** Minimal AST shape findInterfaceProperty needs. */
+export interface InterfacePropertyAstSlice {
+  interfaces: Array<{
+    name: string;
+    extends?: string[];
+    properties: InterfacePropertySlice[];
+  }>;
+}
+
+/**
+ * The property `propName` declared on `ifaceTypeName` or anywhere on its
+ * EXTENDS chain. The first declaration in a breadth-first walk is the one
+ * callers type against. Two declarations of the same name with a different
+ * type or Get/Set direction are rejected by the analyzer
+ * (`interfaceClosureClashes`); this lookup does not silently bless that
+ * program. Undefined when the interface or the property is unknown —
+ * including interfaces from pre-property dependency libraries, whose chunk
+ * text carries no property declarations.
+ */
+export function findInterfaceProperty(
+  ast: InterfacePropertyAstSlice | undefined,
+  ifaceTypeName: string,
+  propName: string,
+): InterfacePropertySlice | undefined {
+  if (!ast) return undefined;
+  const propUpper = propName.toUpperCase();
+  const visited = new Set<string>();
+  const queue = [ifaceTypeName.toUpperCase()];
+  while (queue.length > 0) {
+    const name = queue.shift()!;
+    if (visited.has(name)) continue;
+    visited.add(name);
+    const iface = ast.interfaces.find((i) => i.name.toUpperCase() === name);
+    if (!iface) continue;
+    const prop = iface.properties.find(
+      (p) => p.name.toUpperCase() === propUpper,
+    );
+    if (prop) return prop;
+    for (const parent of iface.extends ?? []) {
+      queue.push(parent.toUpperCase());
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Property types match when the type name, STRING/WSTRING length, array
+ * element, and array bounds all match. Comparing `type.name` alone treats
+ * `STRING(10)` and `STRING(20)`, and two `ARRAY OF` shapes, as the same type.
+ */
+export function propertyTypesEqual(
+  a: PropertyTypeRef,
+  b: PropertyTypeRef,
+): boolean {
+  if (a.name.toUpperCase() !== b.name.toUpperCase()) return false;
+  const aRef =
+    a.referenceKind && a.referenceKind !== "none" ? a.referenceKind : "";
+  const bRef =
+    b.referenceKind && b.referenceKind !== "none" ? b.referenceKind : "";
+  if (aRef !== bRef) return false;
+  const aLen = a.maxLength === undefined ? "" : String(a.maxLength);
+  const bLen = b.maxLength === undefined ? "" : String(b.maxLength);
+  if (aLen !== bLen) return false;
+  const aElem = (a.elementTypeName ?? "").toUpperCase();
+  const bElem = (b.elementTypeName ?? "").toUpperCase();
+  if (aElem !== bElem) return false;
+  const aDims = a.arrayDimensions ?? [];
+  const bDims = b.arrayDimensions ?? [];
+  if (aDims.length !== bDims.length) return false;
+  for (let i = 0; i < aDims.length; i++) {
+    if (
+      aDims[i]!.start !== bDims[i]!.start ||
+      aDims[i]!.end !== bDims[i]!.end
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Short type text for a property-signature diagnostic. */
+export function formatPropertyType(t: PropertyTypeRef): string {
+  if (t.arrayDimensions && t.arrayDimensions.length > 0) {
+    const dims = t.arrayDimensions
+      .map((d) => `${d.start}..${d.end}`)
+      .join(", ");
+    return `ARRAY[${dims}] OF ${t.elementTypeName ?? t.name}`;
+  }
+  if (t.maxLength !== undefined) return `${t.name}(${t.maxLength})`;
+  return t.name;
+}
+
+/**
+ * Get/Set direction from the accessor text. No accessors (or both) is
+ * read-write; a lone GET is read-only; a lone SET is write-only.
+ */
+export function propertyDirectionLabel(prop: {
+  getter?: unknown;
+  setter?: unknown;
+}): "read-write" | "read-only" | "write-only" {
+  const canGet = prop.setter === undefined || prop.getter !== undefined;
+  const canSet = prop.getter === undefined || prop.setter !== undefined;
+  if (canGet && canSet) return "read-write";
+  if (canGet) return "read-only";
+  return "write-only";
+}
+
+/** One name collision inside an interface EXTENDS closure. */
+export interface InterfaceClosureClash {
+  kind: "method-property" | "property-signature";
+  /** Upper-case member name. */
+  name: string;
+  /** Declaring interfaces and, for a property clash, each signature. */
+  detail: string;
+}
+
+/**
+ * Name collisions in one interface's EXTENDS closure.
+ *
+ * A method and a property cannot share a name. Two properties of the same
+ * name must have the same type and the same Get/Set direction; the later
+ * declaration is not dropped. Identical redeclarations (a diamond of the
+ * same property) are not a clash.
+ */
+export function interfaceClosureClashes(
+  ast: {
+    interfaces: Array<{
+      name: string;
+      extends?: string[];
+      methods: Array<{ name: string }>;
+      properties: InterfacePropertySlice[];
+    }>;
+  },
+  ifaceTypeName: string,
+): InterfaceClosureClash[] {
+  const byUpper = new Map(
+    ast.interfaces.map((iface) => [iface.name.toUpperCase(), iface]),
+  );
+  const methods: Array<{ name: string; iface: string }> = [];
+  const properties: Array<{ prop: InterfacePropertySlice; iface: string }> = [];
+  const visited = new Set<string>();
+  const queue = [ifaceTypeName.toUpperCase()];
+  while (queue.length > 0) {
+    const name = queue.shift()!;
+    if (visited.has(name)) continue;
+    visited.add(name);
+    const iface = byUpper.get(name);
+    if (!iface) continue;
+    for (const method of iface.methods) {
+      methods.push({ name: method.name.toUpperCase(), iface: name });
+    }
+    for (const prop of iface.properties) {
+      properties.push({ prop, iface: name });
+    }
+    for (const parent of iface.extends ?? []) {
+      queue.push(parent.toUpperCase());
+    }
+  }
+
+  const clashes: InterfaceClosureClash[] = [];
+  const methodIface = new Map<string, string>();
+  for (const method of methods) {
+    if (!methodIface.has(method.name))
+      methodIface.set(method.name, method.iface);
+  }
+  const propsByName = new Map<
+    string,
+    Array<{ prop: InterfacePropertySlice; iface: string }>
+  >();
+  for (const entry of properties) {
+    const key = entry.prop.name.toUpperCase();
+    const list = propsByName.get(key) ?? [];
+    list.push(entry);
+    propsByName.set(key, list);
+  }
+
+  for (const [key, list] of propsByName) {
+    const methodOn = methodIface.get(key);
+    if (methodOn !== undefined) {
+      clashes.push({
+        kind: "method-property",
+        name: key,
+        detail: `method on '${methodOn}'`,
+      });
+    }
+    const first = list[0]!;
+    const differs = list.some(
+      (entry) =>
+        !propertyTypesEqual(first.prop.type, entry.prop.type) ||
+        propertyDirectionLabel(first.prop) !==
+          propertyDirectionLabel(entry.prop),
+    );
+    if (differs) {
+      const detail = list
+        .map(
+          (entry) =>
+            `'${entry.iface}' declares ${formatPropertyType(entry.prop.type)} ${propertyDirectionLabel(entry.prop)}`,
+        )
+        .join("; ");
+      clashes.push({ kind: "property-signature", name: key, detail });
+    }
+  }
+  return clashes;
+}
+
+/**
  * Whether a resolved type is one of the IEC generic type groups rather than a
  * concrete type. Overloaded standard functions are published with one of these
  * as their declared return type (e.g. NOT -> ANY_BIT); such a result must be
@@ -483,6 +805,12 @@ export function getCommonType(a: IECType, b: IECType): IECType | undefined {
 
 /**
  * Resolve the type of a struct or FB field by looking up the type definition in the AST.
+ *
+ * A function block member may be a variable or a property. The search walks
+ * EXTENDS from the named block toward its parents. On each block a property
+ * wins over a same-named variable, and the nearest block wins over a parent,
+ * so `d.Speed` on a derived block is the inherited property rather than a
+ * field the derived block does not declare.
  */
 export function resolveFieldType(
   typeName: string,
@@ -506,9 +834,20 @@ export function resolveFieldType(
     }
   }
 
-  // Check FB var blocks (FB instance member access)
-  for (const fb of ast.functionBlocks) {
-    if (fb.name.toUpperCase() === typeUpper) {
+  // FB variables and properties, nearest declaration on the EXTENDS chain.
+  const fbByName = new Map(
+    ast.functionBlocks.map((fb) => [fb.name.toUpperCase(), fb]),
+  );
+  if (fbByName.has(typeUpper)) {
+    const visited = new Set<string>();
+    let current: string | undefined = typeUpper;
+    while (current && !visited.has(current)) {
+      visited.add(current);
+      const fb = fbByName.get(current);
+      if (!fb) break;
+      for (const prop of fb.properties) {
+        if (prop.name.toUpperCase() === fieldUpper) return prop.type.name;
+      }
       for (const block of fb.varBlocks) {
         for (const decl of block.declarations) {
           for (const name of decl.names) {
@@ -516,8 +855,9 @@ export function resolveFieldType(
           }
         }
       }
-      return undefined;
+      current = fb.extends?.toUpperCase();
     }
+    return undefined;
   }
 
   // Check programs (program instance member access)

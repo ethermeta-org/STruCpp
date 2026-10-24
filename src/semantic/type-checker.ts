@@ -40,6 +40,10 @@ import {
   resolveArrayElementType,
   typeName as typeNameUtil,
   isGenericGroupType,
+  QUERY_INTERFACE_FN,
+  collectImplementedInterfaces,
+  interfaceExtends,
+  findInterfaceProperty,
 } from "./type-utils.js";
 import { stripEnEno } from "../ast-utils.js";
 
@@ -122,6 +126,13 @@ export class TypeChecker {
   private errors: CompileError[] = [];
   private warnings: CompileError[] = [];
   private ast: CompilationUnit | undefined;
+  /**
+   * True while resolving an assignment *target* expression. Interface
+   * property direction rules differ per side: writing a read-only
+   * property and reading a write-only one are both compile errors, so
+   * the field resolution needs to know which side of `:=` it is typing.
+   */
+  private inferringAssignmentTarget = false;
 
   constructor(
     private symbolTables: SymbolTables,
@@ -204,6 +215,59 @@ export class TypeChecker {
       expr.resolvedType = type;
     }
     return type;
+  }
+
+  /**
+   * Interface property step in a member chain (`itf.Speed`): resolve the
+   * declared type and enforce the access direction the interface text
+   * declares. Only the last step of an assignment target is a write —
+   * `itf.Box.Value := 1` reads `Box` even when `Box` is read-only.
+   * A write-only property in the middle of the chain is a read and is
+   * rejected. Undefined when the field is not a property of a known
+   * interface.
+   */
+  private resolveInterfacePropertyFieldType(
+    ifaceTypeName: string,
+    fieldName: string,
+    span: { startLine: number; startCol: number; file?: string },
+    writing: boolean,
+  ): string | undefined {
+    const upper = ifaceTypeName.toUpperCase();
+    if (!this.isInterfaceTypeName(upper)) return undefined;
+    const prop = findInterfaceProperty(this.ast, upper, fieldName);
+    if (!prop) return undefined;
+    // Direction from the interface text: no accessors = read-write (both
+    // sides legal); a lone GET = read-only; a lone SET = write-only.
+    const isReadOnly = prop.getter !== undefined && prop.setter === undefined;
+    const isWriteOnly = prop.setter !== undefined && prop.getter === undefined;
+    if (writing && isReadOnly) {
+      this.addError(
+        `Cannot assign to read-only property '${prop.name}' of interface '${upper}': the interface declares no SET accessor.`,
+        span.startLine,
+        span.startCol,
+        span.file,
+      );
+    }
+    if (!writing && isWriteOnly) {
+      this.addError(
+        `Cannot read write-only property '${prop.name}' of interface '${upper}': the interface declares no GET accessor.`,
+        span.startLine,
+        span.startCol,
+        span.file,
+      );
+    }
+    return prop.type.name;
+  }
+
+  /**
+   * Resolve an index expression as a read. The assignment-target flag stays
+   * set for the chain being typed, and an index is not that chain's write.
+   */
+  private resolveIndexRead(idx: Expression, scope: Scope): void {
+    const saved = this.inferringAssignmentTarget;
+    this.inferringAssignmentTarget = false;
+    this.resolveExprType(idx, scope);
+    this.inferringAssignmentTarget = saved;
   }
 
   /**
@@ -415,15 +479,28 @@ export class TypeChecker {
 
     // Resolve access chain (accessChain is the preferred path)
     if (expr.accessChain && expr.accessChain.length > 0 && this.ast) {
-      for (const step of expr.accessChain) {
+      for (
+        let stepIndex = 0;
+        stepIndex < expr.accessChain.length;
+        stepIndex++
+      ) {
+        const step = expr.accessChain[stepIndex]!;
+        const writing =
+          this.inferringAssignmentTarget &&
+          stepIndex === expr.accessChain.length - 1 &&
+          step.kind === "field";
         if (!currentTypeName) break;
 
         if (step.kind === "field") {
           // Resolve struct/FB field (local AST + dependency-library FB members)
-          const fieldType = this.resolveFieldTypeAnywhere(
-            currentTypeName,
-            step.name,
-          );
+          const fieldType =
+            this.resolveFieldTypeAnywhere(currentTypeName, step.name) ??
+            this.resolveInterfacePropertyFieldType(
+              currentTypeName,
+              step.name,
+              expr.sourceSpan,
+              writing,
+            );
           if (fieldType) {
             currentTypeName = fieldType;
             currentType = this.resolveNamedType(fieldType);
@@ -449,7 +526,7 @@ export class TypeChecker {
           }
           // Also resolve the index expressions
           for (const idx of step.indices) {
-            this.resolveExprType(idx, scope);
+            this.resolveIndexRead(idx, scope);
           }
         } else if (step.kind === "dereference") {
           if (currentType?.typeKind === "reference") {
@@ -468,7 +545,7 @@ export class TypeChecker {
       // Resolve subscripts (array indexing on the base variable)
       if (expr.subscripts.length > 0 && currentTypeName) {
         for (const sub of expr.subscripts) {
-          this.resolveExprType(sub, scope);
+          this.resolveIndexRead(sub, scope);
         }
         const elemType = resolveArrayElementType(currentTypeName, this.ast);
         if (elemType) {
@@ -479,7 +556,15 @@ export class TypeChecker {
 
       // Resolve field access chain
       if (expr.fieldAccess.length > 0 && currentTypeName) {
-        for (const field of expr.fieldAccess) {
+        for (
+          let fieldIndex = 0;
+          fieldIndex < expr.fieldAccess.length;
+          fieldIndex++
+        ) {
+          const field = expr.fieldAccess[fieldIndex]!;
+          const writing =
+            this.inferringAssignmentTarget &&
+            fieldIndex === expr.fieldAccess.length - 1;
           if (!currentTypeName) break;
 
           if (/^\d+$/.test(field)) {
@@ -487,10 +572,14 @@ export class TypeChecker {
             currentType = ELEMENTARY_TYPES["BOOL"];
             currentTypeName = "BOOL";
           } else {
-            const fieldType = this.resolveFieldTypeAnywhere(
-              currentTypeName,
-              field,
-            );
+            const fieldType: string | undefined =
+              this.resolveFieldTypeAnywhere(currentTypeName, field) ??
+              this.resolveInterfacePropertyFieldType(
+                currentTypeName,
+                field,
+                expr.sourceSpan,
+                writing,
+              );
             if (fieldType) {
               currentTypeName = fieldType;
               currentType = this.resolveNamedType(fieldType);
@@ -606,6 +695,11 @@ export class TypeChecker {
 
     const nameUpper = expr.functionName.toUpperCase();
 
+    // Compiler builtin — not a registry or user function.
+    if (nameUpper === QUERY_INTERFACE_FN) {
+      return this.inferQueryInterfaceType(expr);
+    }
+
     // Check user-defined functions in symbol tables
     const funcSymbol = this.symbolTables.lookupFunction(expr.functionName);
     if (funcSymbol !== undefined) {
@@ -670,9 +764,14 @@ export class TypeChecker {
       }
     }
 
-    // Could be a function block invocation (treated as statement, no return)
+    // Could be a function block invocation (treated as statement, no return).
+    // An interface-typed input uses the same rule as `itf := value`.
     const fbInstance = scope.lookup(expr.functionName);
     if (fbInstance?.kind === "variable") {
+      this.validateFbInterfaceArguments(
+        expr,
+        fbInstance.declaration?.type?.name,
+      );
       return undefined;
     }
 
@@ -735,6 +834,41 @@ export class TypeChecker {
       }
     }
 
+    // Interface reference object: the method may be declared on this
+    // interface or on one of its EXTENDS parents; the return type is the
+    // declared one (elementary or a placeholder carrying the name).
+    if (this.ast) {
+      const ifaceByName = new Map(
+        this.ast.interfaces.map((i) => [i.name.toUpperCase(), i]),
+      );
+      const visited = new Set<string>();
+      const queue: string[] = [objTypeName.toUpperCase()];
+      while (queue.length > 0) {
+        const name = queue.shift()!;
+        if (visited.has(name)) continue;
+        visited.add(name);
+        const iface = ifaceByName.get(name);
+        if (!iface) continue;
+        const method = iface.methods.find(
+          (m) => m.name.toUpperCase() === expr.methodName.toUpperCase(),
+        );
+        if (method?.returnType) {
+          const retType =
+            ELEMENTARY_TYPES[method.returnType.name.toUpperCase()] ??
+            ({
+              typeKind: "elementary",
+              name: method.returnType.name,
+              sizeBits: 0,
+            } as ElementaryType);
+          expr.resolvedType = retType;
+          return retType;
+        }
+        for (const parent of iface.extends ?? []) {
+          queue.push(parent.toUpperCase());
+        }
+      }
+    }
+
     return undefined;
   }
 
@@ -793,7 +927,9 @@ export class TypeChecker {
   private checkStatement(stmt: Statement, scope: Scope): void {
     switch (stmt.kind) {
       case "AssignmentStatement": {
+        this.inferringAssignmentTarget = true;
         const targetType = this.resolveExprType(stmt.target, scope);
+        this.inferringAssignmentTarget = false;
         const valueType = this.resolveExprType(stmt.value, scope);
         this.validateAssignment(targetType, valueType, stmt.target, stmt.value);
         break;
@@ -961,6 +1097,21 @@ export class TypeChecker {
   ): void {
     if (!targetType || !valueType) return;
 
+    // Interface variable assignment (`itf := fb` / `itf := itf2`): CODESYS
+    // accepts only an instance whose type implements the interface — the
+    // FB's own IMPLEMENTS plus its EXTENDS chain plus the interface's
+    // EXTENDS — or another compatible interface reference.
+    const targetIfaceName = this.getInterfaceTypeName(targetType);
+    if (targetIfaceName !== undefined) {
+      this.validateInterfaceAssignment(
+        targetIfaceName,
+        valueType,
+        target,
+        value,
+      );
+      return;
+    }
+
     // Integer/real/bool literals without explicit type prefix are polymorphic:
     // they can be assigned to any compatible numeric or bit type.
     if (this.isUntypedNumericLiteral(value)) {
@@ -1031,6 +1182,266 @@ export class TypeChecker {
       );
       return;
     }
+  }
+
+  /**
+   * Upper-case interface type name when `type` is (a placeholder for) one
+   * of this unit's declared interfaces; undefined otherwise.
+   */
+  private getInterfaceTypeName(type: IECType | undefined): string | undefined {
+    if (!type || type.typeKind !== "elementary") return undefined;
+    const name = (type as ElementaryType).name.toUpperCase();
+    return this.ast?.interfaces.some((i) => i.name.toUpperCase() === name)
+      ? name
+      : undefined;
+  }
+
+  private isInterfaceTypeName(nameUpper: string): boolean {
+    return (
+      this.ast?.interfaces.some((i) => i.name.toUpperCase() === nameUpper) ===
+      true
+    );
+  }
+
+  private isFunctionBlockTypeName(nameUpper: string): boolean {
+    if (
+      this.ast?.functionBlocks.some((fb) => fb.name.toUpperCase() === nameUpper)
+    ) {
+      return true;
+    }
+    return this.symbolTables.lookupFunctionBlock(nameUpper) !== undefined;
+  }
+
+  /** Strip parentheses so a parenthesized variable still counts as a variable. */
+  private unwrapParentheses(expr: Expression): Expression {
+    let current = expr;
+    while (current.kind === "ParenthesizedExpression") {
+      current = current.expression;
+    }
+    return current;
+  }
+
+  /**
+   * Interface-typed inputs of a function-block call follow the same rule as
+   * `itf := value`.
+   */
+  private validateFbInterfaceArguments(
+    expr: FunctionCallExpression,
+    declaredTypeName: string | undefined,
+  ): void {
+    if (!declaredTypeName) return;
+    let fbTypeName = declaredTypeName;
+    if (expr.instance && this.ast) {
+      const element = resolveArrayElementType(fbTypeName, this.ast);
+      if (element) fbTypeName = element;
+    }
+    if (!this.isFunctionBlockTypeName(fbTypeName.toUpperCase())) return;
+    const params = this.fbCallParams(fbTypeName);
+    if (params.length === 0) return;
+
+    const userArgs = stripEnEno(expr.arguments);
+    const named = new Map<string, Expression>();
+    const positional: Expression[] = [];
+    for (const arg of userArgs) {
+      if (arg.isOutput) continue;
+      if (arg.name !== undefined) named.set(arg.name.toUpperCase(), arg.value);
+      else positional.push(arg.value);
+    }
+
+    let positionalIndex = 0;
+    for (const param of params) {
+      const key = param.name.toUpperCase();
+      let value: Expression | undefined;
+      if (named.has(key)) {
+        value = named.get(key);
+      } else if (positionalIndex < positional.length) {
+        value = positional[positionalIndex];
+        positionalIndex++;
+      }
+      if (!value) continue;
+      if (!this.isInterfaceTypeName(param.typeName.toUpperCase())) continue;
+      const valueType = value.resolvedType;
+      if (!valueType) continue;
+      const target: VariableExpression = {
+        kind: "VariableExpression",
+        sourceSpan: value.sourceSpan,
+        name: param.name,
+        fieldAccess: [],
+        subscripts: [],
+        isDereference: false,
+      };
+      this.validateInterfaceAssignment(
+        param.typeName.toUpperCase(),
+        valueType,
+        target,
+        value,
+      );
+    }
+  }
+
+  /** VAR_INPUT then VAR_IN_OUT of a function block, in declaration order. */
+  private fbCallParams(
+    fbTypeName: string,
+  ): Array<{ name: string; typeName: string }> {
+    const upper = fbTypeName.toUpperCase();
+    const fb = this.ast?.functionBlocks.find(
+      (block) => block.name.toUpperCase() === upper,
+    );
+    if (fb) {
+      const params: Array<{ name: string; typeName: string }> = [];
+      for (const block of fb.varBlocks) {
+        if (
+          block.blockType !== "VAR_INPUT" &&
+          block.blockType !== "VAR_IN_OUT"
+        ) {
+          continue;
+        }
+        for (const decl of block.declarations) {
+          for (const name of decl.names) {
+            params.push({ name, typeName: decl.type.name });
+          }
+        }
+      }
+      return params;
+    }
+    const sym = this.symbolTables.lookupFunctionBlock(fbTypeName);
+    if (!sym) return [];
+    return [...sym.inputs, ...sym.inouts]
+      .filter((variable) => variable.declaration?.type?.name)
+      .map((variable) => ({
+        name: variable.name,
+        typeName: variable.declaration.type.name,
+      }));
+  }
+
+  /**
+   * Interface-variable assignment rules. Only provable violations are
+   * reported: when the value's type cannot be resolved statically (deep
+   * member chains), the templated bind() upcast in the generated C++ is
+   * the compile-time backstop.
+   */
+  private validateInterfaceAssignment(
+    targetIfaceName: string,
+    valueType: IECType,
+    target: Expression,
+    value: Expression,
+  ): void {
+    if (valueType.typeKind !== "elementary") return;
+    const valueName = (valueType as ElementaryType).name.toUpperCase();
+
+    if (this.isInterfaceTypeName(valueName)) {
+      if (this.ast && interfaceExtends(this.ast, valueName, targetIfaceName)) {
+        return; // same interface or a descendant — reference copy
+      }
+      this.addError(
+        `Cannot assign interface '${valueName}' to interface variable '${target.kind === "VariableExpression" ? target.name : ""}' of '${targetIfaceName}': '${valueName}' does not extend '${targetIfaceName}'`,
+        value.sourceSpan.startLine,
+        value.sourceSpan.startCol,
+        value.sourceSpan.file,
+      );
+      return;
+    }
+
+    if (this.isFunctionBlockTypeName(valueName)) {
+      // No declaration in this unit: a library function block. bind()'s
+      // template constraint is the check; do not report "does not implement".
+      const implemented = this.ast
+        ? collectImplementedInterfaces(this.ast, valueName)
+        : undefined;
+      if (implemented === undefined || implemented.has(targetIfaceName)) {
+        return;
+      }
+      this.addError(
+        `Cannot assign '${valueName}' to interface variable '${target.kind === "VariableExpression" ? target.name : ""}' of '${targetIfaceName}': '${valueName}' does not implement '${targetIfaceName}'`,
+        value.sourceSpan.startLine,
+        value.sourceSpan.startCol,
+        value.sourceSpan.file,
+      );
+      return;
+    }
+
+    // Elementary/non-FB value — never a legal interface binding.
+    this.addError(
+      `Cannot assign '${valueName}' to interface variable '${target.kind === "VariableExpression" ? target.name : ""}' of '${targetIfaceName}': only a function block implementing '${targetIfaceName}' or a compatible interface reference can be assigned`,
+      value.sourceSpan.startLine,
+      value.sourceSpan.startCol,
+      value.sourceSpan.file,
+    );
+  }
+
+  /**
+   * `__QUERYINTERFACE(src, dest)` — validate the operand shapes and report
+   * the BOOL result type. The runtime query itself is emitted by codegen.
+   */
+  private inferQueryInterfaceType(
+    expr: FunctionCallExpression,
+  ): IECType | undefined {
+    const retType = ELEMENTARY_TYPES["BOOL"]!;
+    const userArgs = stripEnEno(expr.arguments);
+    if (userArgs.length !== 2) {
+      this.addError(
+        `${QUERY_INTERFACE_FN} expects exactly two arguments (source, destination interface variable), got ${userArgs.length}`,
+        expr.sourceSpan.startLine,
+        expr.sourceSpan.startCol,
+        expr.sourceSpan.file,
+      );
+      expr.resolvedType = retType;
+      return retType;
+    }
+
+    const srcExpr = this.unwrapParentheses(userArgs[0]!.value);
+    if (srcExpr.kind !== "VariableExpression") {
+      this.addError(
+        `${QUERY_INTERFACE_FN} source must be a variable`,
+        srcExpr.sourceSpan.startLine,
+        srcExpr.sourceSpan.startCol,
+        srcExpr.sourceSpan.file,
+      );
+    }
+    const srcType = srcExpr.resolvedType ?? userArgs[0]!.value.resolvedType;
+    const srcName =
+      srcType?.typeKind === "elementary"
+        ? (srcType as ElementaryType).name.toUpperCase()
+        : undefined;
+    if (
+      srcExpr.kind === "VariableExpression" &&
+      srcName !== undefined &&
+      !this.isInterfaceTypeName(srcName) &&
+      !this.isFunctionBlockTypeName(srcName)
+    ) {
+      this.addError(
+        `${QUERY_INTERFACE_FN} source must be a function block instance or an interface reference, but the argument has type '${srcName}'`,
+        srcExpr.sourceSpan.startLine,
+        srcExpr.sourceSpan.startCol,
+        srcExpr.sourceSpan.file,
+      );
+    }
+
+    const destExpr = this.unwrapParentheses(userArgs[1]!.value);
+    if (destExpr.kind !== "VariableExpression") {
+      this.addError(
+        `${QUERY_INTERFACE_FN} destination must be an interface variable`,
+        destExpr.sourceSpan.startLine,
+        destExpr.sourceSpan.startCol,
+        destExpr.sourceSpan.file,
+      );
+    }
+    const destType = destExpr.resolvedType ?? userArgs[1]!.value.resolvedType;
+    const destName =
+      destType?.typeKind === "elementary"
+        ? (destType as ElementaryType).name.toUpperCase()
+        : undefined;
+    if (destName !== undefined && !this.isInterfaceTypeName(destName)) {
+      this.addError(
+        `${QUERY_INTERFACE_FN} destination must be an interface variable, but the argument has type '${destName}'`,
+        destExpr.sourceSpan.startLine,
+        destExpr.sourceSpan.startCol,
+        destExpr.sourceSpan.file,
+      );
+    }
+
+    expr.resolvedType = retType;
+    return retType;
   }
 
   /**

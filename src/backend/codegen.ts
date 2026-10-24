@@ -99,6 +99,8 @@ import {
   resolveArrayShapeByName,
   typeName as typeNameUtil,
   buildEnumMemberMap,
+  QUERY_INTERFACE_FN,
+  findInterfaceProperty,
   type EnumMemberEntry,
 } from "../semantic/type-utils.js";
 import {
@@ -507,10 +509,6 @@ export class CodeGenerator {
   /** Parent class name of current FB (for SUPER resolution) */
   private currentFBExtends: string | undefined;
 
-  /** When generating a method that returns an interface type, assignments to the
-   *  result variable should be converted to return statements */
-  private interfaceReturnMethod = false;
-
   /** Map of UPPER(typeName).UPPER(methodName) → declared method name for case normalization */
   protected methodNameMap: Map<string, string> = new Map();
 
@@ -563,6 +561,11 @@ export class CodeGenerator {
    * store the two lists separately, so a library FB is inputs then inouts. */
   private fbCallParams: Map<string, string[]> = new Map();
 
+  /** UPPER(fbTypeName) → UPPER(paramName) → declared type name. Drives
+   * interface-typed input binding at FB invocation call sites (`inst(itf := fb)`
+   * binds the reference instead of copying a value). */
+  private fbParamTypes: Map<string, Map<string, string>> = new Map();
+
   /** Map of UPPER(fbTypeName) → set of VAR_IN_OUT parameter names (UPPER case).
    *  FB inout params are stored as by-value members with copy-in at the call
    *  site; this set drives the matching copy-back after the call so a callee's
@@ -604,7 +607,10 @@ export class CodeGenerator {
     const vlaMatch = typeName.match(/^__VLA_(\d+)D_(.+)$/);
     if (vlaMatch) {
       const ndims = vlaMatch[1];
-      const elemType = this.mapVarTypeToCpp(vlaMatch[2]!);
+      const elemName = vlaMatch[2]!;
+      const elemType = this.isInterfaceType(elemName)
+        ? `IEC_ITF<${elemName}>`
+        : this.mapVarTypeToCpp(elemName);
       return `ArrayView${ndims}D<${elemType}>`;
     }
     // Handle parameterized STRING(n) / WSTRING(n) / STRING(CONSTANT_NAME)
@@ -748,21 +754,29 @@ export class CodeGenerator {
     arrayDimensions?: Array<{ start: number; end: number }>;
     elementTypeName?: string;
   }): string {
+    const interfaceRef = (typeName: string): string | undefined =>
+      this.isInterfaceType(typeName) ? `IEC_ITF<${typeName}>` : undefined;
+
     let baseType: string;
 
     // Handle inline array types with dimension info
     // Array1D stores T directly — use IECVar-wrapped types for elementary elements
-    // and bare names for composites (whose fields already contain IECVar leaves)
+    // and bare names for composites (whose fields already contain IECVar leaves).
+    // An interface element is an IEC_ITF<T> reference, not the abstract class.
     if (typeRef.arrayDimensions && typeRef.elementTypeName) {
-      const elemCpp = this.isUserDefinedType(typeRef.elementTypeName)
-        ? typeRef.elementTypeName
-        : this.mapVarTypeToCpp(typeRef.elementTypeName);
+      const elemCpp =
+        interfaceRef(typeRef.elementTypeName) ??
+        (this.isUserDefinedType(typeRef.elementTypeName)
+          ? typeRef.elementTypeName
+          : this.mapVarTypeToCpp(typeRef.elementTypeName));
       baseType = formatArrayType(elemCpp, typeRef.arrayDimensions);
     } else {
-      baseType = this.mapVarTypeToCpp(
-        typeRef.name,
-        typeof typeRef.maxLength === "number" ? typeRef.maxLength : undefined,
-      );
+      baseType =
+        interfaceRef(typeRef.name) ??
+        this.mapVarTypeToCpp(
+          typeRef.name,
+          typeof typeRef.maxLength === "number" ? typeRef.maxLength : undefined,
+        );
     }
 
     if (
@@ -772,11 +786,14 @@ export class CodeGenerator {
     ) {
       // Pointer (IEC_Ptr<T>) and reference (IEC_REF_TO<T> / IEC_REFERENCE_TO<T>)
       // wrappers all take the raw element type (not IECVar-wrapped); they wrap
-      // an IECVar<T> internally.
+      // an IECVar<T> internally. An interface element keeps that outer wrapper
+      // around IEC_ITF<T>.
       let elemType: string;
       if (typeRef.arrayDimensions && typeRef.elementTypeName) {
         // Array pointer/reference: baseType is already raw (Array1D<...>)
         elemType = baseType;
+      } else if (interfaceRef(typeRef.name)) {
+        elemType = interfaceRef(typeRef.name)!;
       } else if (this.isUserDefinedType(typeRef.name)) {
         // UDT: use raw struct/FB/program name
         elemType = this.knownProgramTypes.has(typeRef.name.toUpperCase())
@@ -1182,6 +1199,7 @@ export class CodeGenerator {
       const inputNames: string[] = [];
       const inoutNames: string[] = [];
       const callNames: string[] = [];
+      const paramTypes: Map<string, string> = new Map();
       for (const block of fb.varBlocks) {
         const isInput = block.blockType === "VAR_INPUT";
         const isInout = block.blockType === "VAR_IN_OUT";
@@ -1192,6 +1210,7 @@ export class CodeGenerator {
           for (const name of decl.names) {
             const upper = name.toUpperCase();
             callNames.push(upper);
+            paramTypes.set(upper, decl.type.name);
             if (isInput) {
               inputNames.push(upper);
             } else {
@@ -1206,12 +1225,16 @@ export class CodeGenerator {
       if (callNames.length > 0) {
         this.fbCallParams.set(fb.name.toUpperCase(), callNames);
       }
+      if (paramTypes.size > 0) {
+        this.fbParamTypes.set(fb.name.toUpperCase(), paramTypes);
+      }
       if (inoutNames.length > 0) {
         this.fbInoutParams.set(fb.name.toUpperCase(), new Set(inoutNames));
       }
     }
 
-    // Build set of known interface types, method name map, and per-interface method sets
+    // Build set of known interface types, method/property name maps, and
+    // per-interface method sets
     for (const iface of ast.interfaces) {
       this.knownInterfaceTypes.add(iface.name.toUpperCase());
       const ifaceMethods = new Set<string>();
@@ -1228,6 +1251,35 @@ export class CodeGenerator {
       );
     }
 
+    // Interface property name map: each interface's key resolves the whole
+    // EXTENDS closure, so `IChild EXTENDS IHas` maps ICHILD.SPEED too —
+    // reference reads/writes must find inherited properties. Nearest
+    // declaration wins.
+    for (const iface of ast.interfaces) {
+      const registered = new Set<string>();
+      const visited = new Set<string>();
+      const queue = [iface.name.toUpperCase()];
+      while (queue.length > 0) {
+        const name = queue.shift()!;
+        if (visited.has(name)) continue;
+        visited.add(name);
+        const it = ast.interfaces.find((i) => i.name.toUpperCase() === name);
+        if (!it) continue;
+        for (const prop of it.properties) {
+          const key = prop.name.toUpperCase();
+          if (registered.has(key)) continue;
+          registered.add(key);
+          this.propertyNameMap.set(
+            `${iface.name.toUpperCase()}.${key}`,
+            prop.name,
+          );
+        }
+        for (const parent of it.extends ?? []) {
+          queue.push(parent.toUpperCase());
+        }
+      }
+    }
+
     // Build method name map, property name map, and interface method names for FBs
     for (const fb of ast.functionBlocks) {
       for (const method of fb.methods) {
@@ -1236,18 +1288,17 @@ export class CodeGenerator {
           method.name,
         );
       }
-      for (const prop of fb.properties) {
-        this.propertyNameMap.set(
-          `${fb.name.toUpperCase()}.${prop.name.toUpperCase()}`,
-          prop.name,
-        );
-      }
       // Precompute interface method names for each FB (for field access mangling)
       const ifaceMethods = this.getInterfaceMethodNames(fb);
       if (ifaceMethods.size > 0) {
         this.fbInterfaceMethodNames.set(fb.name.toUpperCase(), ifaceMethods);
       }
     }
+    // Inherited properties too: `d.Speed` on a derived block is get_/set_,
+    // not a field the derived block does not declare. The block's own
+    // property wins; a same-named variable on a nearer block blocks a
+    // parent property so the real field is still emitted.
+    this.registerFbPropertyNames(ast);
 
     // Build set of known struct/UDT types and enum member maps
     const enumDescriptors: Array<{ name: string; members: string[] }> = [];
@@ -1440,6 +1491,7 @@ export class CodeGenerator {
     this.emitHeader('#include "iec_struct.hpp"');
     this.emitHeader('#include "iec_memory.hpp"');
     this.emitHeader('#include "iec_pointer.hpp"');
+    this.emitHeader('#include "iec_interface.hpp"');
     this.emitHeader('#include "iec_string.hpp"');
     this.emitHeader('#include "iec_wstring.hpp"');
     this.emitHeader("#include <array>");
@@ -1540,6 +1592,7 @@ export class CodeGenerator {
         // Struct fields must mangle by the same rule as everything else that
         // names them, and only codegen knows the FB / program type names.
         isUserDefinedType: (t) => this.isUserDefinedType(t),
+        isInterfaceType: (t) => this.isInterfaceType(t),
       });
       const typeCode = typeCodeGen.generateFromRegistry(typeRegistry);
       for (const line of typeCode.split(this.options.lineEnding)) {
@@ -1553,7 +1606,7 @@ export class CodeGenerator {
       for (const block of ast.globalVarBlocks) {
         const constQualifier = block.isConstant ? "const " : "";
         for (const decl of block.declarations) {
-          const cppType = this.mapTypeRefToCpp(decl.type);
+          const cppType = this.mapVarDeclTypeToCpp(decl.type);
           for (const name of decl.names) {
             // `inline`, not a static-local behind a reference: the debug table takes
             // their address into PROGMEM, which needs a constant.
@@ -1871,11 +1924,14 @@ export class CodeGenerator {
     // Build inheritance clause
     const bases: string[] = [];
     if (fb.extends) {
+      // Function-block EXTENDS stays ordinary single inheritance.
       bases.push(`public ${fb.extends}`);
     }
     if (fb.implements) {
+      // Interface bases are virtual so I1 and I2 both EXTENDS IBase share
+      // one IBase subobject. Otherwise dynamic_cast<IBase*> is ambiguous.
       for (const iface of fb.implements) {
-        bases.push(`public ${iface}`);
+        bases.push(`virtual public ${iface}`);
       }
     }
     const inheritance = bases.length > 0 ? ` : ${bases.join(", ")}` : "";
@@ -1918,7 +1974,7 @@ export class CodeGenerator {
 
       this.emitHeader(`    ${comment}`);
       for (const decl of block.declarations) {
-        const cppType = this.mapTypeRefToCpp(decl.type);
+        const cppType = this.mapVarDeclTypeToCpp(decl.type);
         const tag = this.elaboratedTagIfShadowed(decl.type.name, fbMemberNames);
         for (const name of decl.names) {
           const memberName = this.mangleMemberIfNeeded(name, decl.type.name);
@@ -2016,7 +2072,7 @@ export class CodeGenerator {
     // Generate member variables and collect located variables
     for (const block of prog.varBlocks) {
       for (const decl of block.declarations) {
-        const cppType = this.mapTypeRefToCpp(decl.type);
+        const cppType = this.mapVarDeclTypeToCpp(decl.type);
         for (const name of decl.names) {
           const memberName = this.mangleMemberIfNeeded(name, decl.type.name);
           this.emitHeaderLineDirective(decl.sourceSpan.startLine);
@@ -2083,7 +2139,7 @@ export class CodeGenerator {
       if (block.blockType === "VAR_INPUT") {
         for (const decl of block.declarations) {
           for (const name of decl.names) {
-            params.push(`${this.mapTypeRefToCpp(decl.type)} ${name}`);
+            params.push(`${this.mapVarDeclTypeToCpp(decl.type)} ${name}`);
           }
         }
       } else if (block.blockType === "VAR_IN_OUT") {
@@ -2095,10 +2151,10 @@ export class CodeGenerator {
             } else {
               // mapTypeRefToCpp preserves arrayDimensions / elementTypeName
               // (so inline ARRAY params emit Array1D<...>) but we still want
-              // STRING/WSTRING maxLength dropped so any string size binds to
-              // the &-reference — strip it on a shallow copy of the typeRef.
+              // STRING/WSTRING maxLength dropped so any string size binds to the
+              // &-reference — strip it on a shallow copy of the typeRef.
               params.push(
-                `${this.mapTypeRefToCpp(this.toParamTypeRef(decl.type))}& ${name}`,
+                `${this.mapVarDeclTypeToCpp(this.toParamTypeRef(decl.type))}& ${name}`,
               );
             }
           }
@@ -2108,7 +2164,7 @@ export class CodeGenerator {
           for (const name of decl.names) {
             // Same metadata-aware lookup as VAR_IN_OUT — see the comment above.
             params.push(
-              `${this.mapTypeRefToCpp(this.toParamTypeRef(decl.type))}& ${name}`,
+              `${this.mapVarDeclTypeToCpp(this.toParamTypeRef(decl.type))}& ${name}`,
             );
           }
         }
@@ -2130,7 +2186,7 @@ export class CodeGenerator {
   ): void {
     const extendsClause =
       iface.extends && iface.extends.length > 0
-        ? ` : ${iface.extends.map((e) => `public ${e}`).join(", ")}`
+        ? ` : ${iface.extends.map((e) => `virtual public ${e}`).join(", ")}`
         : "";
 
     this.emitHeaderLineDirective(iface.sourceSpan.startLine);
@@ -2141,10 +2197,10 @@ export class CodeGenerator {
     this.recordHeaderLineMapping(iface.sourceSpan.startLine, classLine);
 
     for (const method of iface.methods) {
-      const isIfaceReturn =
-        method.returnType && this.isInterfaceType(method.returnType.name);
+      // An interface return is IEC_ITF<T> by value, not a reference to the
+      // abstract class. An unbound call substitutes IEC_ITF<T>().
       const returnType = method.returnType
-        ? `${this.mapTypeRefToCpp(method.returnType)}${isIfaceReturn ? "&" : ""}`
+        ? this.mapTypeRefToCpp(method.returnType)
         : "void";
       const params = this.generateMethodParamList(method);
       if (method.sourceSpan) {
@@ -2159,6 +2215,30 @@ export class CodeGenerator {
           `    virtual ${returnType} ${method.name}(${params}) = 0;`,
         );
       }
+    }
+
+    // Pure-virtual accessors per interface property. Direction comes from
+    // the interface text alone: no accessors = read-write (CODESYS default),
+    // a lone GET = read-only, a lone SET = write-only. The accessor
+    // signatures match generatePropertyDeclarations so a conforming FB
+    // override binds without redeclaration.
+    for (const prop of iface.properties) {
+      const types = this.propertyCppTypes(prop.type);
+      const needsGet = prop.setter === undefined || prop.getter !== undefined;
+      const needsSet = prop.getter === undefined || prop.setter !== undefined;
+      this.emitHeaderLineDirective(prop.sourceSpan.startLine);
+      const propLine = this.currentHeaderLine;
+      if (needsGet) {
+        this.emitHeader(
+          `    virtual ${types.value} get_${prop.name}() const = 0;`,
+        );
+      }
+      if (needsSet) {
+        this.emitHeader(
+          `    virtual void set_${prop.name}(${types.setParam} ${prop.name}) = 0;`,
+        );
+      }
+      this.recordHeaderLineMapping(prop.sourceSpan.startLine, propLine);
     }
 
     this.emitHeader("};");
@@ -2220,10 +2300,8 @@ export class CodeGenerator {
       }
 
       for (const method of visMethods) {
-        const isIfaceReturn =
-          method.returnType && this.isInterfaceType(method.returnType.name);
         const returnType = method.returnType
-          ? `${this.mapTypeRefToCpp(method.returnType)}${isIfaceReturn ? "&" : ""}`
+          ? this.mapTypeRefToCpp(method.returnType)
           : "void";
         const params = this.generateMethodParamList(method);
 
@@ -2268,7 +2346,7 @@ export class CodeGenerator {
       if (block.blockType === "VAR_INPUT") {
         for (const decl of block.declarations) {
           for (const name of decl.names) {
-            params.push(`${this.mapTypeRefToCpp(decl.type)} ${name}`);
+            params.push(`${this.mapVarDeclTypeToCpp(decl.type)} ${name}`);
           }
         }
       } else if (block.blockType === "VAR_IN_OUT") {
@@ -2279,7 +2357,7 @@ export class CodeGenerator {
             // toParamTypeRef strips STRING/WSTRING maxLength so any
             // string size binds to the &-reference.
             params.push(
-              `${this.mapTypeRefToCpp(this.toParamTypeRef(decl.type))}& ${name}`,
+              `${this.mapVarDeclTypeToCpp(this.toParamTypeRef(decl.type))}& ${name}`,
             );
           }
         }
@@ -2287,7 +2365,7 @@ export class CodeGenerator {
         for (const decl of block.declarations) {
           for (const name of decl.names) {
             params.push(
-              `${this.mapTypeRefToCpp(this.toParamTypeRef(decl.type))}& ${name}`,
+              `${this.mapVarDeclTypeToCpp(this.toParamTypeRef(decl.type))}& ${name}`,
             );
           }
         }
@@ -2304,15 +2382,15 @@ export class CodeGenerator {
   ): void {
     this.emitHeader("    // Properties");
     for (const prop of properties) {
-      const type = this.mapTypeRefToCpp(prop.type);
+      const types = this.propertyCppTypes(prop.type);
       this.emitHeaderLineDirective(prop.sourceSpan.startLine);
       const propLine = this.currentHeaderLine;
       if (prop.getter) {
-        this.emitHeader(`    virtual ${type} get_${prop.name}() const;`);
+        this.emitHeader(`    virtual ${types.value} get_${prop.name}() const;`);
       }
       if (prop.setter) {
         this.emitHeader(
-          `    virtual void set_${prop.name}(${type} ${prop.name});`,
+          `    virtual void set_${prop.name}(${types.setParam} ${prop.name});`,
         );
       }
       this.recordHeaderLineMapping(prop.sourceSpan.startLine, propLine);
@@ -2327,10 +2405,10 @@ export class CodeGenerator {
     method: MethodDeclaration,
     className: string,
   ): void {
-    const isIfaceReturn =
-      method.returnType && this.isInterfaceType(method.returnType.name);
+    const returnsInterface =
+      !!method.returnType && this.isInterfaceType(method.returnType.name);
     const returnType = method.returnType
-      ? `${this.mapTypeRefToCpp(method.returnType)}${isIfaceReturn ? "&" : ""}`
+      ? this.mapTypeRefToCpp(method.returnType)
       : "void";
     const params = this.generateMethodParamList(method);
 
@@ -2339,16 +2417,12 @@ export class CodeGenerator {
     this.emit(`${returnType} ${className}::${method.name}(${params}) {`);
     this.emitDebugFrameGuard(method.body);
 
-    // Declare return variable if method has return type
+    // Declare return variable if method has return type. An interface return
+    // is IEC_ITF<T>, default-constructed unbound; assignments bind it.
     if (method.returnType) {
-      if (isIfaceReturn) {
-        // Interface return: assignments to result become return statements
-        this.interfaceReturnMethod = true;
-      } else {
-        this.emit(
-          `    ${this.mapTypeRefToCpp(method.returnType)} ${method.name}_result;`,
-        );
-      }
+      this.emit(
+        `    ${this.mapTypeRefToCpp(method.returnType)} ${method.name}_result;`,
+      );
       this.currentFunctionName = method.name;
     }
 
@@ -2369,13 +2443,19 @@ export class CodeGenerator {
 
     // Merge FB scope + method scope so FB member types are visible (same pattern as properties)
     this.enterScope([...this.currentFBVarBlocks, ...method.varBlocks]);
+    if (returnsInterface && method.returnType) {
+      this.currentScopeVarTypes.set(
+        method.name.toUpperCase(),
+        method.returnType.name,
+      );
+    }
 
     // Declare local variables (VAR, VAR_TEMP)
     for (const block of method.varBlocks) {
       if (block.blockType === "VAR" || block.blockType === "VAR_TEMP") {
         for (const decl of block.declarations) {
           for (const name of decl.names) {
-            const cppType = this.mapTypeRefToCpp(decl.type);
+            const cppType = this.mapVarDeclTypeToCpp(decl.type);
             const initValue = decl.initialValue
               ? ` = ${this.generateInitializer(decl.initialValue, cppType, decl.type.name)}`
               : "";
@@ -2392,11 +2472,8 @@ export class CodeGenerator {
 
     // Return if method has return type
     if (method.returnType) {
-      if (!isIfaceReturn) {
-        this.emit(`    return ${method.name}_result;`);
-      }
+      this.emit(`    return ${method.name}_result;`);
       this.currentFunctionName = undefined;
-      this.interfaceReturnMethod = false;
     }
 
     // Clean up
@@ -2416,15 +2493,25 @@ export class CodeGenerator {
     prop: PropertyDeclaration,
     className: string,
   ): void {
-    const type = this.mapTypeRefToCpp(prop.type);
+    const types = this.propertyCppTypes(prop.type);
+    const bareInterface =
+      this.isInterfaceType(prop.type.name) &&
+      !prop.type.arrayDimensions &&
+      (prop.type.referenceKind === undefined ||
+        prop.type.referenceKind === "none");
+    if (bareInterface) {
+      // Getter reads/writes redirect to the result variable; the setter
+      // parameter keeps the property name. Both are IEC_ITF<T>.
+      this.currentScopeVarTypes.set(prop.name.toUpperCase(), prop.type.name);
+    }
 
     // Getter
     if (prop.getter) {
       this.emitLineDirective(prop.sourceSpan.startLine);
       const getterLine = this.currentLine;
-      this.emit(`${type} ${className}::get_${prop.name}() const {`);
+      this.emit(`${types.value} ${className}::get_${prop.name}() const {`);
       this.emitDebugFrameGuard(prop.getter);
-      this.emit(`    ${type} ${prop.name}_result;`);
+      this.emit(`    ${types.value} ${prop.name}_result;`);
       this.currentFunctionName = prop.name;
       this.generateStatements(prop.getter);
       this.emit(`    return ${prop.name}_result;`);
@@ -2438,7 +2525,9 @@ export class CodeGenerator {
     if (prop.setter) {
       this.emitLineDirective(prop.sourceSpan.startLine);
       const setterLine = this.currentLine;
-      this.emit(`void ${className}::set_${prop.name}(${type} ${prop.name}) {`);
+      this.emit(
+        `void ${className}::set_${prop.name}(${types.setParam} ${prop.name}) {`,
+      );
       this.emitDebugFrameGuard(prop.setter);
       // In setter, prop.name refers to the input parameter (no redirection)
       this.generateStatements(prop.setter);
@@ -2625,13 +2714,19 @@ export class CodeGenerator {
       this.emit(`    ${retType} ${funcName}_result;`);
       this.currentFunctionName = func.name;
       this.enterScope(func.varBlocks);
+      if (this.isInterfaceType(func.returnType.name)) {
+        this.currentScopeVarTypes.set(
+          func.name.toUpperCase(),
+          func.returnType.name,
+        );
+      }
 
       // Declare local variables (VAR, VAR_TEMP) — same pattern as method locals
       for (const block of func.varBlocks) {
         if (block.blockType === "VAR" || block.blockType === "VAR_TEMP") {
           for (const decl of block.declarations) {
             for (const name of decl.names) {
-              const cppType = this.mapTypeRefToCpp(decl.type);
+              const cppType = this.mapVarDeclTypeToCpp(decl.type);
               const initValue = decl.initialValue
                 ? ` = ${this.generateInitializer(decl.initialValue, cppType, decl.type.name)}`
                 : "";
@@ -3461,10 +3556,41 @@ export class CodeGenerator {
     const propWrite = this.detectPropertyWrite(stmt.target);
     if (propWrite) {
       const value = this.generateExpression(stmt.value);
-      this.emit(
-        `${indent}${propWrite.objectCode}set_${propWrite.propertyName}(${value});`,
-      );
+      if (propWrite.interfaceObjectCode !== undefined) {
+        // Interface reference write: one null guard around one virtual
+        // setter call — an unbound reference ignores the write.
+        this.emit(
+          `${indent}if (${propWrite.interfaceObjectCode}.get() != nullptr) { ${propWrite.interfaceObjectCode}->set_${propWrite.propertyName}(${value}); }`,
+        );
+      } else {
+        this.emit(
+          `${indent}${propWrite.objectCode}set_${propWrite.propertyName}(${value});`,
+        );
+      }
       return;
+    }
+
+    // Interface reference assignment (`itf := fb` / `itf1 := itf2`): the
+    // target binds to the instance (or re-points at the other reference's
+    // instance) rather than copying a value. The analyzer has already
+    // proven the FB type implements the interface, so the templated
+    // bind() upcast always compiles.
+    if (
+      stmt.target.kind === "VariableExpression" &&
+      !stmt.target.isDereference
+    ) {
+      const targetTypeName = this.resolveAccessExprTypeName(stmt.target);
+      if (targetTypeName && this.isInterfaceType(targetTypeName)) {
+        const targetCode = this.generateExpression(stmt.target);
+        const valueCode = this.generateExpression(stmt.value);
+        // An IEC_ITF value (variable, member, or interface-returning call)
+        // binds through its pointer. An FB instance binds directly.
+        const valueIsInterface = this.expressionYieldsInterface(stmt.value);
+        this.emit(
+          `${indent}${targetCode}.bind(${valueIsInterface ? `${valueCode}.get()` : valueCode});`,
+        );
+        return;
+      }
     }
 
     // Composite / array shared-global WRITE (VAR_EXTERNAL to a composite
@@ -3552,16 +3678,6 @@ export class CodeGenerator {
 
     const target = this.generateExpression(stmt.target);
     const value = this.generateExpression(stmt.value);
-
-    // For interface-returning methods, convert assignment to result var into return statement
-    if (
-      this.interfaceReturnMethod &&
-      this.currentFunctionName &&
-      target === `${this.currentFunctionName}_result`
-    ) {
-      this.emit(`${indent}return ${value};`);
-      return;
-    }
 
     this.emit(`${indent}${target} = ${value};`);
   }
@@ -3879,14 +3995,7 @@ export class CodeGenerator {
    * In programs/FBs: return;
    */
   private generateReturnStatement(indent: string): void {
-    if (this.interfaceReturnMethod) {
-      // Interface-returning methods: the assignment-based return path (methodName := expr)
-      // directly emits `return expr;`. A bare `RETURN;` has no value to return, so we
-      // default to `return *this;` which is correct for the common pattern where the
-      // method returns its own FB as the interface implementor. Edge case: if the method
-      // should return a different object, the user must use the assignment form instead.
-      this.emit(`${indent}return *this;`);
-    } else if (this.currentFunctionName) {
+    if (this.currentFunctionName) {
       this.emit(`${indent}return ${this.currentFunctionName}_result;`);
     } else {
       this.emit(`${indent}return;`);
@@ -4269,6 +4378,27 @@ export class CodeGenerator {
         if (isLast) {
           const propName = this.resolvePropertyName(currentType, field);
           if (propName) {
+            // Interface reference: dispatch through the wrapper's pointer,
+            // unbound yields the property type's zero value (CODESYS
+            // semantics — the reference is nullable, the read must not
+            // dereference null). Write-only properties never get here;
+            // the analyzer rejects the read first.
+            if (currentType && this.isInterfaceType(currentType)) {
+              const prop = findInterfaceProperty(
+                this.ast,
+                currentType,
+                propName,
+              );
+              // Read direction: a GET accessor, or no accessors at all
+              // (the read-write default).
+              if (
+                prop &&
+                (prop.getter !== undefined || prop.setter === undefined)
+              ) {
+                result = `(${result}.get() != nullptr ? ${result}->get_${propName}() : ${this.getUnboundZeroExpr(prop.type.name)})`;
+                continue;
+              }
+            }
             result += `.get_${propName}()`;
             continue;
           }
@@ -4332,6 +4462,23 @@ export class CodeGenerator {
           if (isLast) {
             const propName = this.resolvePropertyName(currentType, step.name);
             if (propName) {
+              // Interface reference: guarded virtual getter; unbound reads
+              // the property type's zero value instead of dereferencing
+              // null. Write-only properties never get here — the analyzer
+              // rejects the read first.
+              if (currentType && this.isInterfaceType(currentType)) {
+                const prop = findInterfaceProperty(
+                  this.ast,
+                  currentType,
+                  propName,
+                );
+                if (
+                  prop &&
+                  (prop.getter !== undefined || prop.setter === undefined)
+                ) {
+                  return `(${result}.get() != nullptr ? ${result}->get_${propName}() : ${this.getUnboundZeroExpr(prop.type.name)})`;
+                }
+              }
               result += `.get_${propName}()`;
               return result;
             }
@@ -4455,6 +4602,23 @@ export class CodeGenerator {
    * e.g., fb.method1(args).method2(args) → fb.method1(args).method2(args)
    */
   private generateMethodCallExpression(expr: MethodCallExpression): string {
+    // Interface reference: dispatch through the wrapper's pointer, with an
+    // unbound guard that yields the method's zero value.
+    if (expr.object.kind === "VariableExpression") {
+      const objTypeName = this.resolveAccessExprTypeName(expr.object);
+      if (objTypeName && this.isInterfaceType(objTypeName)) {
+        const objCode = this.generateExpression(expr.object);
+        const args = expr.arguments
+          .map((a) => this.generateExpression(a.value))
+          .join(", ");
+        return this.generateInterfaceMethodCall(
+          objCode,
+          objTypeName,
+          expr.methodName,
+          args,
+        );
+      }
+    }
     const obj = this.generateExpression(expr.object);
     const args = expr.arguments
       .map((a) => this.generateExpression(a.value))
@@ -4897,6 +5061,11 @@ export class CodeGenerator {
   protected generateFunctionCallExpression(
     expr: FunctionCallExpression,
   ): string {
+    // __QUERYINTERFACE(src, dest) — compiler builtin, not a std function.
+    if (expr.functionName.toUpperCase() === QUERY_INTERFACE_FN) {
+      return this.generateQueryInterface(expr);
+    }
+
     // Handle dotted method calls: THIS.method, SUPER.method, instance.method
     if (expr.functionName.includes(".")) {
       const dotAt = expr.functionName.indexOf(".");
@@ -4934,6 +5103,26 @@ export class CodeGenerator {
       const resolvedMethod = varType
         ? this.resolveMethodName(varType, methodName)
         : this.resolveMethodNameGlobal(methodName);
+
+      // Interface reference variable: dispatch through the wrapper with the
+      // unbound guard (dotted calls and MethodCallExpression reach the same
+      // helper).
+      if (varType && this.isInterfaceType(varType)) {
+        const objCode = this.generateVariableExpression({
+          kind: "VariableExpression",
+          name: prefix,
+          fieldAccess: [],
+          subscripts: [],
+          isDereference: false,
+          sourceSpan: expr.sourceSpan,
+        });
+        return this.generateInterfaceMethodCall(
+          objCode,
+          varType,
+          methodName,
+          args.join(", "),
+        );
+      }
 
       if (prefix.toUpperCase() === "THIS") {
         return `this->${resolvedMethod}(${args.join(", ")})`;
@@ -5287,7 +5476,10 @@ export class CodeGenerator {
    */
   private emitOutputTempVar(typeName: string): string {
     const name = `__output_tmp_${this.tempVarCounter++}`;
-    const cppType = this.mapVarTypeToCpp(typeName);
+    // Interface types instantiate as references, not embedded values.
+    const cppType = this.isInterfaceType(typeName)
+      ? `IEC_ITF<${typeName}>`
+      : this.mapVarTypeToCpp(typeName);
     this.emit(`${this.currentStatementIndent}${cppType} ${name};`);
     return name;
   }
@@ -5328,6 +5520,263 @@ export class CodeGenerator {
   }
 
   /**
+   * C++ type for a *declared variable*. An interface type becomes an
+   * IEC_ITF<T> reference (CODESYS semantics — nullable, unbound until the
+   * first `:=` or a successful __QUERYINTERFACE). ARRAY OF / POINTER TO /
+   * REFERENCE TO / REF_TO an interface keep that outer wrapper around
+   * IEC_ITF<T>. mapTypeRefToCpp owns both cases.
+   */
+  private mapVarDeclTypeToCpp<
+    T extends {
+      name: string;
+      maxLength?: number | string;
+      referenceKind?: string;
+      arrayDimensions?: Array<{ start: number; end: number }>;
+      elementTypeName?: string;
+    },
+  >(typeRef: T): string {
+    return this.mapTypeRefToCpp(typeRef);
+  }
+
+  /**
+   * C++ types for a property. A property whose type is an interface returns
+   * IEC_ITF<T> by value and accepts it as `const IEC_ITF<T>&`. Any other
+   * type, including an array or pointer of interfaces, uses one mapped type
+   * for both accessors.
+   */
+  private propertyCppTypes(typeRef: {
+    name: string;
+    maxLength?: number | string;
+    referenceKind?: string;
+    arrayDimensions?: Array<{ start: number; end: number }>;
+    elementTypeName?: string;
+  }): { value: string; setParam: string } {
+    const value = this.mapTypeRefToCpp(typeRef);
+    const bareInterface =
+      this.isInterfaceType(typeRef.name) &&
+      !typeRef.arrayDimensions &&
+      (typeRef.referenceKind === undefined || typeRef.referenceKind === "none");
+    return bareInterface
+      ? { value, setParam: `const ${value}&` }
+      : { value, setParam: value };
+  }
+
+  /**
+   * Declared type name behind a variable or member-chain expression
+   * (`itf`, `host.itf`): walks the scope's variable types and the AST's
+   * member types. Undefined when the type cannot be resolved statically.
+   */
+  private resolveAccessExprTypeName(
+    expr: VariableExpression,
+  ): string | undefined {
+    let type = this.currentScopeVarTypes.get(expr.name.toUpperCase());
+    if (!type) return undefined;
+    const fields = expr.accessChain
+      ? expr.accessChain.filter((s) => s.kind === "field").map((s) => s.name)
+      : expr.fieldAccess;
+    for (const field of fields) {
+      const next = this.resolveMemberType(type, field);
+      if (!next) return undefined;
+      type = next;
+    }
+    return type;
+  }
+
+  /**
+   * True when the expression lowers to an IEC_ITF value (a variable, a
+   * member, or a call whose return type is an interface). An FB instance
+   * is not one: bind() takes the instance itself.
+   */
+  private expressionYieldsInterface(expr: Expression): boolean {
+    if (expr.kind === "ParenthesizedExpression") {
+      return this.expressionYieldsInterface(expr.expression);
+    }
+    if (expr.kind === "VariableExpression") {
+      const typeName = this.resolveAccessExprTypeName(expr);
+      return typeName !== undefined && this.isInterfaceType(typeName);
+    }
+    if (
+      expr.kind === "FunctionCallExpression" &&
+      expr.functionName.includes(".")
+    ) {
+      const dot = expr.functionName.indexOf(".");
+      const prefix = expr.functionName.substring(0, dot);
+      const methodName = expr.functionName.substring(dot + 1);
+      const varType = this.currentScopeVarTypes.get(prefix.toUpperCase());
+      if (!varType) return false;
+      if (this.isInterfaceType(varType)) {
+        const method = this.findInterfaceMethod(varType, methodName);
+        return (
+          !!method?.returnType && this.isInterfaceType(method.returnType.name)
+        );
+      }
+      const returned = this.findFbMethodReturnType(varType, methodName);
+      return returned !== undefined && this.isInterfaceType(returned);
+    }
+    if (expr.kind === "FunctionCallExpression" && this.ast) {
+      const func = this.ast.functions.find(
+        (fn) => fn.name.toUpperCase() === expr.functionName.toUpperCase(),
+      );
+      return !!func?.returnType && this.isInterfaceType(func.returnType.name);
+    }
+    if (expr.kind === "MethodCallExpression") {
+      const returned = this.inferExprType(expr);
+      return returned !== undefined && this.isInterfaceType(returned);
+    }
+    return false;
+  }
+
+  /** Return type name of a function-block method, walking EXTENDS. */
+  private findFbMethodReturnType(
+    fbTypeName: string,
+    methodName: string,
+  ): string | undefined {
+    if (!this.ast) return undefined;
+    const byUpper = new Map(
+      this.ast.functionBlocks.map((fb) => [fb.name.toUpperCase(), fb]),
+    );
+    const visited = new Set<string>();
+    let current: string | undefined = fbTypeName.toUpperCase();
+    while (current && !visited.has(current)) {
+      visited.add(current);
+      const fb = byUpper.get(current);
+      if (!fb) break;
+      const method = fb.methods.find(
+        (candidate) =>
+          candidate.name.toUpperCase() === methodName.toUpperCase(),
+      );
+      if (method?.returnType) return method.returnType.name;
+      current = fb.extends?.toUpperCase();
+    }
+    return undefined;
+  }
+
+  /**
+   * Find a method on an interface, walking the interface's EXTENDS chain —
+   * a derived interface's method may be declared on its parent.
+   */
+  private findInterfaceMethod(
+    ifaceTypeName: string,
+    methodName: string,
+  ): MethodDeclaration | undefined {
+    if (!this.ast) return undefined;
+    const byUpper = new Map(
+      this.ast.interfaces.map((i) => [i.name.toUpperCase(), i]),
+    );
+    const visited = new Set<string>();
+    const queue = [ifaceTypeName.toUpperCase()];
+    while (queue.length > 0) {
+      const name = queue.shift()!;
+      if (visited.has(name)) continue;
+      visited.add(name);
+      const iface = byUpper.get(name);
+      if (!iface) continue;
+      const method = iface.methods.find(
+        (m) => m.name.toUpperCase() === methodName.toUpperCase(),
+      );
+      if (method) return method;
+      for (const parent of iface.extends ?? []) {
+        queue.push(parent.toUpperCase());
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Zero value returned by a method call on an unbound interface
+   * reference — the IEC type's own zero, wrapped so a ternary arm has the
+   * method's exact C++ type (IEC_INT(0), IEC_BOOL(false), ...).
+   */
+  private getUnboundZeroExpr(typeName: string): string {
+    const elementary = this.getTypeDefaultValue(typeName);
+    if (elementary !== "") {
+      return `${this.mapVarTypeToCpp(typeName)}(${elementary})`;
+    }
+    if (this.isInterfaceType(typeName)) return `IEC_ITF<${typeName}>()`;
+    // User composites (struct/FB/enum) are default-constructible.
+    return `${this.mapVarTypeToCpp(typeName)}()`;
+  }
+
+  /**
+   * Method call through an interface reference, guarded so an unbound
+   * reference yields the method's zero value instead of dereferencing
+   * null — the PLC task must survive an unbound call, never crash.
+   */
+  private generateInterfaceMethodCall(
+    objCode: string,
+    ifaceTypeName: string,
+    methodName: string,
+    argsCode: string,
+  ): string {
+    const resolvedName = this.resolveMethodName(ifaceTypeName, methodName);
+    const call = `${objCode}->${resolvedName}(${argsCode})`;
+    const method = this.findInterfaceMethod(ifaceTypeName, methodName);
+    if (!method?.returnType) {
+      // void — both ternary arms are void so the form works as a
+      // statement and inside a larger expression.
+      return `(${objCode}.get() != nullptr ? (void)${call} : (void)0)`;
+    }
+    // Interface returns are IEC_ITF<T> by value. An unbound reference
+    // yields an empty IEC_ITF<T>() instead of dereferencing null.
+    return `(${objCode}.get() != nullptr ? ${call} : ${this.getUnboundZeroExpr(method.returnType.name)})`;
+  }
+
+  /**
+   * `__QUERYINTERFACE(src, dest)` — CODESYS runtime interface query.
+   * One dynamic_cast against the compiler's own RTTI type identity (no
+   * parallel integer tag table), then dest is rebound: failure binds
+   * nullptr, releasing any previously bound instance. Returns whether the
+   * cast bound a live object. No allocation, no exceptions, no logging.
+   */
+  private generateQueryInterface(expr: FunctionCallExpression): string {
+    const args = expr.arguments;
+    const srcExpr =
+      args.length === 2 ? this.unwrapGeneratedExpr(args[0]!.value) : undefined;
+    const destExpr =
+      args.length === 2 ? this.unwrapGeneratedExpr(args[1]!.value) : undefined;
+    // The type checker rejects a non-variable operand. Do not throw here:
+    // a throw aborts codegen, and a statement-level dynamic_cast would run
+    // once for a WHILE condition and would be a cross-case initialization.
+    if (
+      !srcExpr ||
+      !destExpr ||
+      srcExpr.kind !== "VariableExpression" ||
+      destExpr.kind !== "VariableExpression"
+    ) {
+      return "false";
+    }
+    const src = srcExpr;
+    const dest = destExpr;
+    const destTypeName = this.resolveAccessExprTypeName(dest);
+    if (!destTypeName || !this.isInterfaceType(destTypeName)) {
+      return "false";
+    }
+    const srcTypeName = this.resolveAccessExprTypeName(src);
+    if (!srcTypeName) return "false";
+    const srcCode = this.generateExpression(src);
+    // FB instance → its address; interface reference → the bound pointer.
+    const srcPtr = this.isInterfaceType(srcTypeName)
+      ? `${srcCode}.get()`
+      : `(&${srcCode})`;
+    const destCode = this.generateExpression(dest);
+    const tmp = `__queryinterface_${this.tempVarCounter++}`;
+    // Immediately-invoked lambda, same shape as with_lock: the cast and
+    // bind run when the expression is evaluated, so a WHILE condition
+    // queries every iteration and a CASE arm does not declare a pointer
+    // in the switch scope.
+    return `([&]() { ${destTypeName}* ${tmp} = dynamic_cast<${destTypeName}*>(${srcPtr}); ${destCode}.bind(${tmp}); return ${tmp} != nullptr; }())`;
+  }
+
+  /** Parentheses do not stop an operand from being a variable. */
+  private unwrapGeneratedExpr(expr: Expression): Expression {
+    let current = expr;
+    while (current.kind === "ParenthesizedExpression") {
+      current = current.expression;
+    }
+    return current;
+  }
+
+  /**
    * Resolve the declared case of a method name given the type and method name.
    * Returns the declared name if found, or the original name if not.
    */
@@ -5348,6 +5797,44 @@ export class CodeGenerator {
       }
     }
     return methodName;
+  }
+
+  /**
+   * Register each function block's properties, including those inherited
+   * through EXTENDS. The nearest property wins. A variable of the same name
+   * on this block or a nearer parent hides a further property.
+   */
+  protected registerFbPropertyNames(ast: CompilationUnit): void {
+    const fbByName = new Map(
+      ast.functionBlocks.map((fb) => [fb.name.toUpperCase(), fb]),
+    );
+    for (const fb of ast.functionBlocks) {
+      const registered = new Set<string>();
+      const blocked = new Set<string>();
+      const visited = new Set<string>();
+      let current: string | undefined = fb.name.toUpperCase();
+      while (current && !visited.has(current)) {
+        visited.add(current);
+        const block = fbByName.get(current);
+        if (!block) break;
+        for (const prop of block.properties) {
+          const key = prop.name.toUpperCase();
+          if (!registered.has(key) && !blocked.has(key)) {
+            registered.add(key);
+            this.propertyNameMap.set(
+              `${fb.name.toUpperCase()}.${key}`,
+              prop.name,
+            );
+          }
+        }
+        for (const varBlock of block.varBlocks) {
+          for (const decl of varBlock.declarations) {
+            for (const name of decl.names) blocked.add(name.toUpperCase());
+          }
+        }
+        current = block.extends?.toUpperCase();
+      }
+    }
   }
 
   /**
@@ -5373,6 +5860,10 @@ export class CodeGenerator {
     memberName: string,
   ): string | undefined {
     if (!typeName) return undefined;
+    if (this.isInterfaceType(typeName)) {
+      const prop = findInterfaceProperty(this.ast, typeName, memberName);
+      if (prop) return prop.type.name;
+    }
     if (this.ast) {
       const result = resolveFieldTypeUtil(typeName, memberName, this.ast);
       if (result) return result;
@@ -5385,11 +5876,18 @@ export class CodeGenerator {
 
   /**
    * Detect if an assignment target is a property write (e.g., m.Speed := 75).
-   * Returns the object code prefix and property name if so, undefined otherwise.
+   * Returns the object code prefix and property name if so, undefined
+   * otherwise. For an interface reference the object code lives in
+   * `interfaceObjectCode` (the reference expression itself) and the caller
+   * emits a bound-guarded virtual setter call.
    */
-  private detectPropertyWrite(
-    target: Expression,
-  ): { objectCode: string; propertyName: string } | undefined {
+  private detectPropertyWrite(target: Expression):
+    | {
+        objectCode: string;
+        propertyName: string;
+        interfaceObjectCode?: string;
+      }
+    | undefined {
     if (target.kind !== "VariableExpression") return undefined;
     const expr = target;
     if (expr.fieldAccess.length === 0) return undefined;
@@ -5411,6 +5909,35 @@ export class CodeGenerator {
     if (!currentType) return undefined;
     const propName = this.resolvePropertyName(currentType, lastField);
     if (!propName) return undefined;
+
+    // Interface reference: `itf.Prop := v` dispatches through the wrapper's
+    // pointer; an unbound reference ignores the write instead of crashing.
+    // Read-only properties never get here — the analyzer rejects the write.
+    if (this.isInterfaceType(currentType)) {
+      const prop = findInterfaceProperty(this.ast, currentType, propName);
+      // Write direction: a SET accessor, or no accessors at all (the
+      // read-write default).
+      if (!prop || (prop.setter === undefined && prop.getter !== undefined)) {
+        return undefined;
+      }
+      const baseExpr: VariableExpression = {
+        ...expr,
+        fieldAccess: expr.fieldAccess.slice(0, -1),
+      };
+      if (expr.accessChain) {
+        const trimmed = this.trimLastFieldFromAccessChain(expr.accessChain);
+        if (trimmed) {
+          baseExpr.accessChain = trimmed;
+        } else {
+          delete baseExpr.accessChain;
+        }
+      }
+      return {
+        objectCode: "",
+        propertyName: propName,
+        interfaceObjectCode: this.generateVariableExpression(baseExpr),
+      };
+    }
 
     // Build the object code (everything except the last field)
     let objectCode: string;
@@ -5730,6 +6257,36 @@ export class CodeGenerator {
     }
   }
 
+  /**
+   * Declared type name of an FB call parameter. Map first (populated by
+   * generate()); AST fallback covers generators that skip generate()
+   * (TestCodeGenerator) and library FBs registered out-of-band.
+   */
+  private fbParamTypeName(
+    fbTypeName: string | undefined,
+    paramName: string,
+  ): string | undefined {
+    if (!fbTypeName) return undefined;
+    const upper = fbTypeName.toUpperCase();
+    const fromMap = this.fbParamTypes.get(upper)?.get(paramName);
+    if (fromMap) return fromMap;
+    const fb = this.ast?.functionBlocks.find(
+      (f) => f.name.toUpperCase() === upper,
+    );
+    if (!fb) return undefined;
+    for (const block of fb.varBlocks) {
+      if (block.blockType !== "VAR_INPUT" && block.blockType !== "VAR_IN_OUT") {
+        continue;
+      }
+      for (const decl of block.declarations) {
+        for (const name of decl.names) {
+          if (name.toUpperCase() === paramName) return decl.type.name;
+        }
+      }
+    }
+    return undefined;
+  }
+
   private generateFBInvocation(
     call: FunctionCallExpression,
     indent: string,
@@ -5796,9 +6353,18 @@ export class CodeGenerator {
         continue;
       }
       const member = this.fbParamMemberName(paramName, fbTypeName);
-      this.emit(
-        `${indent}${instanceName}.${member} = ${this.generateExpression(arg.value)};`,
-      );
+      const valueCode = this.generateExpression(arg.value);
+      const paramTypeName = this.fbParamTypeName(fbTypeName, paramName);
+      if (paramTypeName && this.isInterfaceType(paramTypeName)) {
+        // Interface-typed input: bind the reference (an FB instance binds
+        // directly; an IEC_ITF value goes through its pointer).
+        const valueIsInterface = this.expressionYieldsInterface(arg.value);
+        this.emit(
+          `${indent}${instanceName}.${member}.bind(${valueIsInterface ? `${valueCode}.get()` : valueCode});`,
+        );
+      } else {
+        this.emit(`${indent}${instanceName}.${member} = ${valueCode};`);
+      }
       if (inoutParams && inoutParams.has(paramName)) {
         inoutWriteback.push({ value: arg.value, member });
       }

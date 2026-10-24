@@ -59,6 +59,8 @@ export interface TypeCodeGenOptions {
    *  back to "anything that is not elementary", all a bare TypeCodeGenerator
    *  can tell from a list of type declarations. */
   isUserDefinedType: (typeName: string) => boolean;
+  /** Interface types are stored as IEC_ITF<T>, never as the abstract class. */
+  isInterfaceType: (typeName: string) => boolean;
 }
 
 /**
@@ -70,6 +72,7 @@ export const defaultTypeCodeGenOptions: TypeCodeGenOptions = {
   emitChunkMarkers: false,
   isUserDefinedType: (typeName: string) =>
     !isElementaryType(typeName.toUpperCase()),
+  isInterfaceType: () => false,
 };
 
 /**
@@ -496,8 +499,12 @@ export class TypeCodeGenerator {
     let cppType: string;
     if (def.arrayDimensions && def.elementTypeName) {
       // POINTER TO ARRAY[...] OF T — use array template
-      const elemCpp = this.mapTypeToCpp(def.elementTypeName);
+      const elemCpp = this.options.isInterfaceType(def.elementTypeName)
+        ? `IEC_ITF<${def.elementTypeName}>`
+        : this.mapTypeToCpp(def.elementTypeName);
       cppType = formatArrayType(elemCpp, def.arrayDimensions);
+    } else if (this.options.isInterfaceType(def.name)) {
+      cppType = `IEC_ITF<${def.name}>`;
     } else {
       cppType = this.mapTypeToCpp(def.name);
     }
@@ -532,6 +539,10 @@ export class TypeCodeGenerator {
     maxLength?: number | string,
   ): string {
     const upperName = typeName.toUpperCase();
+
+    if (this.options.isInterfaceType(typeName)) {
+      return `IEC_ITF<${typeName}>`;
+    }
 
     // STRING/WSTRING with optional length → IECStringVar/IECWStringVar (forceable)
     if (upperName === "STRING") {

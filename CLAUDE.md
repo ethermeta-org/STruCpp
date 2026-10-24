@@ -66,7 +66,7 @@ Generates two files: `.cpp` (implementation) and `.hpp` (header). All generated 
 - **Completed**: Phase 5.2 (OOP extensions - methods, interfaces, inheritance, properties, semantic validations)
 - **Completed**: Phase 5.3 (IEC 61131-3 Standard FB Library - TON/TOF/TP/CTU/CTD/R_TRIG/F_TRIG/SR/RS as compiled ST library)
 - **Completed**: Phase 5.4 (Testing strategy for FB/OOP)
-- **Pending**: Phase 6 (CODESYS compatibility - POINTER TO, UNION, FB_Init/FB_Exit, \_\_QUERYINTERFACE, bit access, typed literals, 64-bit time types, ACTION, exceptions, generics, conditional compilation)
+- **Pending**: Phase 6 (CODESYS compatibility - POINTER TO, UNION, FB_Init/FB_Exit, bit access, typed literals, 64-bit time types, ACTION, exceptions, generics, conditional compilation. \_\_QUERYINTERFACE and interface references landed in Phase 5.2 follow-up)
 - **Pending**: Phase 7 (OpenPLC runtime integration - located variable infrastructure already complete)
 - **Pending**: Phase 8 (optimizations and advanced debug support)
 - **Pending**: Phase 9 (IEC 61131-3 testing framework)

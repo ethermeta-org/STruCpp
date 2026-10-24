@@ -192,12 +192,52 @@ export class STParser extends CstParser {
         DEF: () => this.CONSUME2(tokens.Identifier),
       });
     });
-    // Interface methods (abstract, no body)
+    // Interface members: abstract methods and statement-free properties
     this.MANY(() => {
-      this.SUBRULE(this.interfaceMethodDeclaration);
+      this.OR([
+        { ALT: () => this.SUBRULE(this.interfaceMethodDeclaration) },
+        { ALT: () => this.SUBRULE(this.interfacePropertyDeclaration) },
+      ]);
     });
     this.CONSUME(tokens.END_INTERFACE);
   });
+
+  /**
+   * Interface property declaration (CODESYS: no accessor statements).
+   * An empty `GET` declares a read direction, an empty `SET` a write
+   * direction; neither accessor means read-write. Statements inside an
+   * accessor are accepted by the grammar so the parser can point at them,
+   * then rejected by the analyzer.
+   */
+  public interfacePropertyDeclaration = this.RULE(
+    "interfacePropertyDeclaration",
+    () => {
+      this.CONSUME(tokens.PROPERTY);
+      this.CONSUME(tokens.Identifier);
+      this.CONSUME(tokens.Colon);
+      // Same type position as a variable: elementary/derived, or ARRAY OF.
+      this.OR({
+        DEF: [
+          {
+            ALT: () => this.SUBRULE(this.arrayType),
+            GATE: () => this.LA(1).tokenType === tokens.ARRAY,
+          },
+          { ALT: () => this.SUBRULE(this.dataType) },
+        ],
+        IGNORE_AMBIGUITIES: true,
+      });
+      this.MANY(() => {
+        this.OR2({
+          DEF: [
+            { ALT: () => this.SUBRULE(this.propertyGetter) },
+            { ALT: () => this.SUBRULE(this.propertySetter) },
+          ],
+          IGNORE_AMBIGUITIES: true,
+        });
+      });
+      this.CONSUME(tokens.END_PROPERTY);
+    },
+  );
 
   /**
    * Interface method declaration (no body, implicitly abstract)
@@ -325,7 +365,17 @@ export class STParser extends CstParser {
     });
     this.CONSUME(tokens.Identifier);
     this.CONSUME(tokens.Colon);
-    this.SUBRULE(this.dataType);
+    // Same type position as a variable: elementary/derived, or ARRAY OF.
+    this.OR3({
+      DEF: [
+        {
+          ALT: () => this.SUBRULE(this.arrayType),
+          GATE: () => this.LA(1).tokenType === tokens.ARRAY,
+        },
+        { ALT: () => this.SUBRULE(this.dataType) },
+      ],
+      IGNORE_AMBIGUITIES: true,
+    });
     // GET and/or SET blocks
     this.MANY(() => {
       this.OR2({
