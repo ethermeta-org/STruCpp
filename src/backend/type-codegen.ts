@@ -60,7 +60,7 @@ export interface TypeCodeGenOptions {
    *  back to "anything that is not elementary", all a bare TypeCodeGenerator
    *  can tell from a list of type declarations. */
   isUserDefinedType: (typeName: string) => boolean;
-  /** Whether a type name is an INTERFACE; a field of that type holds an `IEC_INTERFACE<I>`. */
+  /** Interface types are stored as IEC_ITF<T>, never as the abstract class. */
   isInterfaceType: (typeName: string) => boolean;
 }
 
@@ -546,13 +546,15 @@ export class TypeCodeGenerator {
     let cppType: string;
     if (def.arrayDimensions && def.elementTypeName) {
       // POINTER TO ARRAY[...] OF T — use array template
-      const elemCpp = def.elementReferenceChain
-        ? wrapReferenceChain(
-            def.elementReferenceChain,
-            this.mapTypeToCpp(def.elementTypeName),
-          )
+      const elemBase = this.options.isInterfaceType(def.elementTypeName)
+        ? `IEC_ITF<${def.elementTypeName}>`
         : this.mapTypeToCpp(def.elementTypeName);
+      const elemCpp = def.elementReferenceChain
+        ? wrapReferenceChain(def.elementReferenceChain, elemBase)
+        : elemBase;
       cppType = formatArrayType(elemCpp, def.arrayDimensions);
+    } else if (this.options.isInterfaceType(def.name)) {
+      cppType = `IEC_ITF<${def.name}>`;
     } else {
       cppType = this.mapTypeToCpp(def.name);
     }
@@ -574,8 +576,11 @@ export class TypeCodeGenerator {
     referenceChain: readonly string[] | undefined,
     maxLength?: number | string,
   ): string {
+    const inner = this.options.isInterfaceType(typeName)
+      ? `IEC_ITF<${typeName}>`
+      : this.mapTypeToCpp(typeName);
     return referenceChain
-      ? wrapReferenceChain(referenceChain, this.mapTypeToCpp(typeName))
+      ? wrapReferenceChain(referenceChain, inner)
       : this.mapStructFieldTypeToCpp(typeName, maxLength);
   }
 
@@ -604,6 +609,10 @@ export class TypeCodeGenerator {
   ): string {
     const upperName = typeName.toUpperCase();
 
+    if (this.options.isInterfaceType(typeName)) {
+      return `IEC_ITF<${typeName}>`;
+    }
+
     // STRING/WSTRING with optional length → IECStringVar/IECWStringVar (forceable)
     if (upperName === "STRING") {
       const len = maxLength ?? 254;
@@ -622,10 +631,6 @@ export class TypeCodeGenerator {
     // Enum types → IEC_<Name> (resolves to IEC_ENUM<Name> via alias)
     if (this.knownEnumNames.has(upperName)) {
       return `IEC_${typeName}`;
-    }
-
-    if (this.options.isInterfaceType(typeName)) {
-      return `IEC_INTERFACE<${typeName}>`;
     }
 
     // Composite types (struct, array, FB) → bare name

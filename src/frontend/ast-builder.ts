@@ -676,9 +676,12 @@ export class ASTBuilder {
     for (const methodNode of getAllNodes(children.interfaceMethodDeclaration)) {
       methods.push(this.buildInterfaceMethodDeclaration(methodNode));
     }
-    const properties = getAllNodes(children.propertyDeclaration).map((n) =>
-      this.buildPropertyDeclaration(n),
-    );
+    // Build interface properties (accessor statements are rejected by the
+    // analyzer, not the grammar — see interfacePropertyDeclaration)
+    const properties: PropertyDeclaration[] = [];
+    for (const propNode of getAllNodes(children.interfacePropertyDeclaration)) {
+      properties.push(this.buildPropertyDeclaration(propNode));
+    }
 
     return {
       kind: "InterfaceDeclaration",
@@ -831,17 +834,21 @@ export class ASTBuilder {
     else if (children.PROTECTED) visibility = "PROTECTED";
     else if (children.INTERNAL) visibility = "INTERNAL";
 
-    // Property type
+    // Property type. An inline ARRAY keeps its bounds so IMPLEMENTS can
+    // tell ARRAY[0..3] OF INT from ARRAY[0..7] OF INT.
+    const arrayTypeNode = getFirstNode(children.arrayType);
     const dataTypeNode = getFirstNode(children.dataType);
-    const type: TypeReference = dataTypeNode
-      ? this.buildTypeReference(dataTypeNode)
-      : {
-          kind: "TypeReference",
-          sourceSpan: nodeToSourceSpan(node),
-          name: "INT",
-          isReference: false,
-          referenceKind: "none",
-        };
+    const type: TypeReference = arrayTypeNode
+      ? this.buildInlineArrayTypeReference(arrayTypeNode)
+      : dataTypeNode
+        ? this.buildTypeReference(dataTypeNode)
+        : {
+            kind: "TypeReference",
+            sourceSpan: nodeToSourceSpan(node),
+            name: "INT",
+            isReference: false,
+            referenceKind: "none",
+          };
 
     // GET block
     let getter: Statement[] | undefined;

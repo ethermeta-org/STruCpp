@@ -469,7 +469,7 @@ function getChildren(node: ASTNode): ASTNode[] {
 
     case "InterfaceDeclaration": {
       const id = node as InterfaceDeclaration;
-      children.push(...id.methods);
+      children.push(...id.methods, ...id.properties);
       break;
     }
 

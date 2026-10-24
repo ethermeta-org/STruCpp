@@ -207,14 +207,20 @@ export interface InterfaceDeclaration extends ASTNode {
   name: string;
   extends?: string[];
   methods: MethodDeclaration[];
-  /** Property signatures: the accessors present (empty bodies) are the ones implementations must provide. */
+  /**
+   * Statement-free property declarations. The access direction is which
+   * accessors the interface text carries: neither → read-write, only
+   * `getter` → read-only, only `setter` → write-only.
+   */
   properties: PropertyDeclaration[];
   /** Set on an interface a linked library declares: checked like the unit's own, emitted by the library. */
   library?: string;
 }
 
 /**
- * PROPERTY declaration within a Function Block, or a property signature within an INTERFACE
+ * PROPERTY declaration within a Function Block (with accessor statements)
+ * or within an INTERFACE (accessor statements forbidden; presence of the
+ * accessor alone declares the direction)
  */
 export interface PropertyDeclaration extends ASTNode {
   kind: "PropertyDeclaration";

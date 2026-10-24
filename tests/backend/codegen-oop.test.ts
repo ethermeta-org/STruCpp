@@ -213,7 +213,7 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
       `);
 
       expect(result.headerCode).toContain(
-        "class ROBOT : public IFIRST, public ISECOND {",
+        "class ROBOT : virtual public IFIRST, virtual public ISECOND {",
       );
     });
 
@@ -230,7 +230,7 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
       `);
 
       expect(result.headerCode).toContain(
-        "class WORKER : public IRUNNABLE {",
+        "class WORKER : virtual public IRUNNABLE {",
       );
     });
   });
@@ -255,7 +255,7 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
       `);
 
       expect(result.headerCode).toContain(
-        "class SMARTMOTOR : public BASE, public IMOVABLE {",
+        "class SMARTMOTOR : public BASE, virtual public IMOVABLE {",
       );
     });
 
@@ -274,7 +274,7 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
       `);
 
       expect(result.headerCode).toContain(
-        "class CHILD : public PARENT, public IA, public IB {",
+        "class CHILD : public PARENT, virtual public IA, virtual public IB {",
       );
     });
   });
@@ -368,7 +368,10 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
       const childSection = result.cppCode.slice(
         result.cppCode.indexOf("void CHILD::operator()()"),
       );
-      const childBody = childSection.slice(0, childSection.indexOf("\n}\n") + 3);
+      const childBody = childSection.slice(
+        0,
+        childSection.indexOf("\n}\n") + 3,
+      );
       expect(childBody).not.toContain("BASE::operator()()");
     });
   });
@@ -809,7 +812,9 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
         PROGRAM Main END_PROGRAM
       `);
 
-      expect(result.headerCode).toContain("class IDERIVED : public IBASE {");
+      expect(result.headerCode).toContain(
+        "class IDERIVED : virtual public IBASE {",
+      );
     });
 
     it("should generate correct pure virtual methods for derived interface", () => {
@@ -940,7 +945,7 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
 
       // Derived FB with both extends and implements
       expect(result.headerCode).toContain(
-        "class MOTOR : public DEVICE, public ICONTROLLABLE {",
+        "class MOTOR : public DEVICE, virtual public ICONTROLLABLE {",
       );
 
       // Method implementations

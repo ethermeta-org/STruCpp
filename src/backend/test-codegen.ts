@@ -73,13 +73,8 @@ export class TestCodeGenerator extends CodeGenerator {
           method.name,
         );
       }
-      for (const prop of fb.properties) {
-        this.propertyNameMap.set(
-          `${fb.name.toUpperCase()}.${prop.name.toUpperCase()}`,
-          prop.name,
-        );
-      }
     }
+    this.registerFbPropertyNames(ast);
     this.initMemberNaming(ast);
     const enumDescriptors: Array<{ name: string; members: string[] }> = [];
     for (const td of ast.types) {
