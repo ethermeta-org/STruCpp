@@ -1045,13 +1045,32 @@ export function compile(
     // have no way to rebuild. But the retain is partial, and a partial retain
     // nobody is told about is a fault discovered after a power cycle with
     // nothing in the build to point at — so it is said, every build.
+    const retainDrops = dbg.incomplete.filter((item) => item.fatal === true);
     for (const item of dbg.incomplete) {
+      if (item.fatal === true) continue;
       pipeline.warnings.push({
         message: item.reason,
         line: 0,
         column: 0,
         severity: "warning",
       });
+    }
+    if (retainDrops.length > 0) {
+      return {
+        success: false,
+        cppFiles: [],
+        cppCode: "",
+        headerCode: "",
+        lineMap: new Map(),
+        headerLineMap: new Map(),
+        errors: retainDrops.map((item) => ({
+          message: `${item.path}: ${item.reason}`,
+          line: 0,
+          column: 0,
+          severity: "error" as const,
+        })),
+        warnings: pipeline.warnings,
+      };
     }
 
     // A leaf the walk could not register is not debuggable: it is absent from

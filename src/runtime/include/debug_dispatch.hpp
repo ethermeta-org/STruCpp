@@ -147,6 +147,76 @@ inline const void* ptr_impl(const void* p, uint16_t* len) noexcept {
 // STRING / WSTRING operations, per capacity, live in debug_string_ops.hpp (included through debug_table.hpp).
 // A plain STRING / WSTRING is `IECStringVar<254>` / `IECWStringVar<254>`.
 
+// Retain stores the IEC capacity, not the debug window.
+constexpr uint8_t DEBUG_STRING_LEN_PREFIX = 1;
+constexpr uint16_t RETAIN_STRING_LEN_PREFIX = 1;
+/* IECString / IECWString default MaxLen. Same number as
+ * DISPATCH_STRING_CAPACITY in debug-table-gen.ts. C++14 has no empty
+ * template argument list, so the default cannot be named IECString<RETAIN_STRING_CAP>. */
+constexpr uint16_t RETAIN_STRING_CAP = 254;
+static_assert(IECString<RETAIN_STRING_CAP>::max_length == RETAIN_STRING_CAP,
+              "retain string capacity");
+static_assert(IECWString<RETAIN_STRING_CAP>::max_length == RETAIN_STRING_CAP,
+              "retain wstring capacity");
+static_assert(RETAIN_STRING_CAP <= 255, "retain string length prefix is uint8");
+constexpr uint16_t RETAIN_STRING_WIDTH = RETAIN_STRING_LEN_PREFIX + RETAIN_STRING_CAP;
+constexpr uint16_t RETAIN_WSTRING_WIDTH =
+    RETAIN_STRING_LEN_PREFIX + static_cast<uint16_t>(RETAIN_STRING_CAP * 2);
+
+// Retain image: the underlying value, full IEC capacity. The debug window
+// above stays truncated so a Modbus frame does not grow.
+inline void read_retain_string(const void* p, uint8_t* dest) noexcept {
+    const auto stored = static_cast<const IECStringVar<RETAIN_STRING_CAP>*>(p)->get_underlying();
+    const uint16_t n = static_cast<uint16_t>(stored.length());
+    const uint8_t wire_len = static_cast<uint8_t>(
+        n < RETAIN_STRING_CAP ? n : RETAIN_STRING_CAP);
+    dest[0] = wire_len;
+    if (wire_len > 0) {
+        std::memcpy(dest + 1, stored.c_str(), wire_len);
+    }
+    if (wire_len < RETAIN_STRING_CAP) {
+        std::memset(dest + 1 + wire_len, 0,
+                    static_cast<size_t>(RETAIN_STRING_CAP - wire_len));
+    }
+}
+
+inline void write_retain_string(void* p, const uint8_t* bytes) noexcept {
+    auto* var = static_cast<IECStringVar<RETAIN_STRING_CAP>*>(p);
+    const uint8_t wire_len = bytes[0] < RETAIN_STRING_CAP
+        ? bytes[0] : static_cast<uint8_t>(RETAIN_STRING_CAP);
+    var->set(IECString<RETAIN_STRING_CAP>(reinterpret_cast<const char*>(bytes + 1), wire_len));
+}
+
+inline void read_retain_wstring(const void* p, uint8_t* dest) noexcept {
+    const auto stored = static_cast<const IECWStringVar<RETAIN_STRING_CAP>*>(p)->get_underlying();
+    const uint16_t n = static_cast<uint16_t>(stored.length());
+    const uint8_t wire_len = static_cast<uint8_t>(
+        n < RETAIN_STRING_CAP ? n : RETAIN_STRING_CAP);
+    dest[0] = wire_len;
+    const char16_t* src = stored.c_str();
+    for (uint8_t i = 0; i < wire_len; ++i) {
+        dest[1 + i * 2]     = static_cast<uint8_t>(src[i] & 0xFF);
+        dest[1 + i * 2 + 1] = static_cast<uint8_t>((src[i] >> 8) & 0xFF);
+    }
+    const size_t used = RETAIN_STRING_LEN_PREFIX + static_cast<size_t>(wire_len) * 2;
+    if (used < RETAIN_WSTRING_WIDTH) {
+        std::memset(dest + used, 0, RETAIN_WSTRING_WIDTH - used);
+    }
+}
+
+inline void write_retain_wstring(void* p, const uint8_t* bytes) noexcept {
+    auto* var = static_cast<IECWStringVar<RETAIN_STRING_CAP>*>(p);
+    const uint8_t wire_len = bytes[0] < RETAIN_STRING_CAP
+        ? bytes[0] : static_cast<uint8_t>(RETAIN_STRING_CAP);
+    char16_t buf[RETAIN_STRING_CAP];
+    for (uint8_t i = 0; i < wire_len; ++i) {
+        buf[i] = static_cast<char16_t>(bytes[1 + i * 2])
+               | static_cast<char16_t>(static_cast<char16_t>(bytes[1 + i * 2 + 1]) << 8);
+    }
+    var->set(IECWString<RETAIN_STRING_CAP>(buf, wire_len));
+}
+
+
 // ---------------------------------------------------------------------------
 // Dispatch table entry. The `size` field is the byte width consumed/produced
 // by force/read (for strings: reserved, handled specially).
@@ -368,6 +438,7 @@ inline uint8_t validate_payload(uint8_t tag, const uint8_t* bytes, uint16_t len)
 
     if (tag == TAG_STRING || tag == TAG_WSTRING || tag == TAG_STRING_REF ||
         tag == TAG_WSTRING_REF) {
+        if (len < DEBUG_STRING_LEN_PREFIX) return STATUS_DATA_TOO_LARGE;
         const uint8_t count = bytes[0];
         if (count > DEBUG_STRING_CAP) return STATUS_DATA_TOO_LARGE;
         const bool wide = tag == TAG_WSTRING || tag == TAG_WSTRING_REF;
@@ -424,9 +495,10 @@ inline uint8_t handle_write(uint8_t arr, uint16_t elem,
                             const uint8_t* bytes, uint16_t len) noexcept {
     Entry e = read_entry(arr, elem);
     if (!e.ptr || e.tag >= TAG__COUNT) return STATUS_OUT_OF_BOUNDS;
-    // Same gate as handle_set. This is also the path the retain restore walk
-    // uses, so a CONSTANT can never be clobbered by a stale retained value
-    // either — constants come from the declaration, never from storage.
+    // Same gate as handle_set. A CONSTANT can never be clobbered by a stale
+    // retained value either — constants come from the declaration, never
+    // from storage. Retain restore uses handle_retain_write, which keeps
+    // this gate and does not go through the debug string window.
     if (e.flags & LEAF_FLAG_READONLY) return STATUS_READ_ONLY;
     const uint8_t bad = validate_payload(e.tag, bytes, len);
     if (bad != STATUS_OK) return bad;
@@ -439,6 +511,83 @@ inline uint16_t handle_size(uint8_t arr, uint16_t elem) noexcept {
     Entry e = read_entry(arr, elem);
     if (!e.ptr || e.tag >= TAG__COUNT) return 0;
     return type_ops[e.tag].size;
+}
+
+template <typename T>
+inline void read_underlying_impl(const void* p, uint8_t* dest) noexcept {
+    const T v = static_cast<const IECVar<T>*>(p)->get_underlying();
+    std::memcpy(dest, &v, sizeof(T));
+}
+
+inline void read_underlying_by_tag(uint8_t tag, const void* p, uint8_t* dest) noexcept {
+    switch (tag) {
+    case TAG_BOOL:  read_underlying_impl<BOOL_t>(p, dest); break;
+    case TAG_SINT:  read_underlying_impl<SINT_t>(p, dest); break;
+    case TAG_USINT: read_underlying_impl<USINT_t>(p, dest); break;
+    case TAG_INT:   read_underlying_impl<INT_t>(p, dest); break;
+    case TAG_UINT:  read_underlying_impl<UINT_t>(p, dest); break;
+    case TAG_DINT:  read_underlying_impl<DINT_t>(p, dest); break;
+    case TAG_UDINT: read_underlying_impl<UDINT_t>(p, dest); break;
+    case TAG_LINT:  read_underlying_impl<LINT_t>(p, dest); break;
+    case TAG_ULINT: read_underlying_impl<ULINT_t>(p, dest); break;
+    case TAG_REAL:  read_underlying_impl<REAL_t>(p, dest); break;
+    case TAG_LREAL: read_underlying_impl<LREAL_t>(p, dest); break;
+    case TAG_BYTE:  read_underlying_impl<BYTE_t>(p, dest); break;
+    case TAG_WORD:  read_underlying_impl<WORD_t>(p, dest); break;
+    case TAG_DWORD: read_underlying_impl<DWORD_t>(p, dest); break;
+    case TAG_LWORD: read_underlying_impl<LWORD_t>(p, dest); break;
+    case TAG_TIME:  read_underlying_impl<TIME_t>(p, dest); break;
+    case TAG_DATE:  read_underlying_impl<DATE_t>(p, dest); break;
+    case TAG_TOD:   read_underlying_impl<TOD_t>(p, dest); break;
+    case TAG_DT:    read_underlying_impl<DT_t>(p, dest); break;
+    default: break;
+    }
+}
+
+/** Retain width. Strings use the IEC capacity; every other tag matches handle_size. */
+inline uint16_t handle_retain_size(uint8_t arr, uint16_t elem) noexcept {
+    Entry e = read_entry(arr, elem);
+    if (!e.ptr || e.tag >= TAG__COUNT) return 0;
+    if (e.tag == TAG_STRING) return RETAIN_STRING_WIDTH;
+    if (e.tag == TAG_WSTRING) return RETAIN_WSTRING_WIDTH;
+    return type_ops[e.tag].size;
+}
+
+/** Retain read: underlying value, never the force overlay. */
+inline uint16_t handle_retain_read(uint8_t arr, uint16_t elem, uint8_t* dest) noexcept {
+    Entry e = read_entry(arr, elem);
+    if (!e.ptr || e.tag >= TAG__COUNT || !dest) return 0;
+    if (e.tag == TAG_STRING) {
+        read_retain_string(e.ptr, dest);
+        return RETAIN_STRING_WIDTH;
+    }
+    if (e.tag == TAG_WSTRING) {
+        read_retain_wstring(e.ptr, dest);
+        return RETAIN_WSTRING_WIDTH;
+    }
+    const uint8_t n = type_ops[e.tag].size;
+    if (n == 0) return 0;
+    read_underlying_by_tag(e.tag, e.ptr, dest);
+    return n;
+}
+
+/** Retain write: plain set(), full string capacity. Never a force. */
+inline uint8_t handle_retain_write(uint8_t arr, uint16_t elem,
+                                   const uint8_t* bytes, uint16_t len) noexcept {
+    Entry e = read_entry(arr, elem);
+    if (!e.ptr || e.tag >= TAG__COUNT) return STATUS_OUT_OF_BOUNDS;
+    if (e.flags & LEAF_FLAG_READONLY) return STATUS_READ_ONLY;
+    if (e.tag == TAG_STRING) {
+        if (!bytes || len < RETAIN_STRING_WIDTH) return STATUS_DATA_TOO_LARGE;
+        write_retain_string(e.ptr, bytes);
+        return STATUS_OK;
+    }
+    if (e.tag == TAG_WSTRING) {
+        if (!bytes || len < RETAIN_WSTRING_WIDTH) return STATUS_DATA_TOO_LARGE;
+        write_retain_wstring(e.ptr, bytes);
+        return STATUS_OK;
+    }
+    return handle_write(arr, elem, bytes, len);
 }
 
 /** Address a leaf's value in place; `out_len` receives its length in BYTES.

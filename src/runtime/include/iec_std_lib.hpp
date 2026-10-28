@@ -38,6 +38,7 @@
 #include "iec_date.hpp"
 #include "iec_dt.hpp"
 #include "iec_tod.hpp"
+#include <atomic>
 #include <cmath>
 #include <algorithm>
 #include <chrono>
@@ -1420,12 +1421,13 @@ inline T MOVE(T value) noexcept {
 // Threaded runtime (OpenPLC v4): each IEC task runs on its own thread and must
 // observe an IEC TIME() value that is STABLE for the duration of its scan and
 // equal to the time at which the dispatcher released it. thread_local gives
-// every worker its own TIME() base; the runtime stamps it via
-// strucpp_set_current_time() at each dispatch, so a slow/overrunning task keeps
-// reading its own snapshot while the dispatcher's master clock advances freely
-// for the other tasks. Gated on STRUCPP_THREADED because single-threaded
-// targets (Arduino/bare-metal) may have no TLS runtime — there it stays a plain
-// global, which is correct for a one-thread scan loop.
+// every worker its own TIME() base. The master clock below is shared.
+// strucpp_advance_time() adds the fast-task interval to the master and stamps
+// the calling thread; strucpp_latch_scan_time() copies the master into the
+// calling thread at the start of every task, including slow ones. Gated on
+// STRUCPP_THREADED because single-threaded targets (Arduino/bare-metal) may
+// have no TLS runtime — there it stays a plain global, which is correct for a
+// one-thread scan loop.
 inline int64_t& __current_time_ns_slot() {
     static thread_local int64_t slot = 0;
     return slot;
@@ -1442,6 +1444,24 @@ inline int64_t& __current_time_ns_slot() {
 }
 static int64_t& __CURRENT_TIME_NS = __current_time_ns_slot();
 #endif
+
+// One master for every task thread in this shared library. Advance only runs
+// on the fastest task; each task latches a snapshot so TIME() does not move
+// mid-scan and a slower task does not stay at T#0s.
+inline std::atomic<int64_t>& __master_time_ns() {
+    static std::atomic<int64_t> master{0};
+    return master;
+}
+
+inline void __advance_master_time(int64_t tick_ns) {
+    const int64_t now =
+        __master_time_ns().fetch_add(tick_ns, std::memory_order_acq_rel) + tick_ns;
+    __CURRENT_TIME_NS = now;
+}
+
+inline void __latch_scan_time() {
+    __CURRENT_TIME_NS = __master_time_ns().load(std::memory_order_acquire);
+}
 
 /**
  * Returns the current scan-cycle time.

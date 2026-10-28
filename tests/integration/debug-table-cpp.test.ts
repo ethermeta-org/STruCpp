@@ -488,10 +488,10 @@ int main() {
   // handle_read() would produce — including through a force — and that a STRING
   // comes back as its payload rather than the [len][payload] wire form.
   //
-  // The force case is the one that motivated read_ptr(): force() writes through
-  // to value_, so raw_ptr() agrees the instant a force is applied — but a
-  // located variable is driven by the program straight into value_ every scan,
-  // and then only read_ptr() still resolves to the forced value.
+  // The force case is why read_ptr() exists: force() keeps the overlay in
+  // forced_value_ and leaves value_ alone. A located variable is driven
+  // straight into value_ every scan, and only read_ptr() still resolves to
+  // the forced value.
   it("addresses the same value handle_read copies, force included", () => {
     const result = compile(
       `PROGRAM Main

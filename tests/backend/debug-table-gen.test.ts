@@ -991,6 +991,27 @@ END_PROGRAM${CFG_R}`,
     expect(r.debugMap!.leaves.map((l) => l.path)).toContain("INSTANCE0.T.Q");
   });
 
+  it("refuses RETAIN STRING(n) that the retain image cannot address", () => {
+    const r = compile(
+      `PROGRAM Main
+VAR RETAIN name : STRING(80); END_VAR
+  name := 'x';
+END_PROGRAM${CFG_R}`,
+    );
+    expect(r.success).toBe(false);
+    expect(r.errors.map((e) => e.message).join("\n")).toMatch(/RETAIN STRING\(80\)/);
+  });
+
+  it("retains a plain STRING at the IEC capacity, not the debug window", () => {
+    const { map } = mapOf(
+      `PROGRAM Main
+VAR RETAIN name : STRING; END_VAR
+  name := 'x';
+END_PROGRAM${CFG_R}`,
+    );
+    expect(map.retainBlobSize).toBe(14 + 1 + 254);
+  });
+
   it("reports the blob size the target has to be able to hold", () => {
     // 14-byte header + DINT(4) + BOOL(1). The editor gates a build on this;
     // getting it wrong there means firmware that silently drops retain.

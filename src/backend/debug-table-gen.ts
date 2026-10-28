@@ -210,6 +210,9 @@ const IEC_NAME_TO_TAG: Record<string, TagName> = {
  * `debug_dispatch.hpp`.
  */
 const DISPATCH_STRING_CAPACITY = 254;
+/** Retain image width: uint8 length plus the IEC capacity. Not the debug window. */
+const RETAIN_STRING_WIDTH = 1 + DISPATCH_STRING_CAPACITY;
+const RETAIN_WSTRING_WIDTH = 1 + DISPATCH_STRING_CAPACITY * 2;
 
 const IEC_NAME_TO_SIZE: Record<string, number> = {
   BOOL: 1,
@@ -419,8 +422,12 @@ export interface DebugTableResult {
   /** Any leaves that couldn't be classified (unsupported type construct,
    *  user-defined enum, reference, etc.). Useful for warnings. */
   skipped: Array<{ path: string; reason: string }>;
-  /** Retained state the walk could not reach; surfaced as compile warnings. */
-  incomplete: Array<{ path: string; reason: string }>;
+  /**
+   * Retained state the walk could not reach. `fatal` is a compile error
+   * (the value cannot be stored). Anything else is a warning: a library
+   * block with no exported locals still builds.
+   */
+  incomplete: Array<{ path: string; reason: string; fatal?: boolean }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -529,12 +536,14 @@ export function generateDebugTable(
    * block whose manifest predates exported locals.
    *
    * Kept apart from `skipped`, which is a normal list nobody reads on a good
-   * build. These are surfaced as compile WARNINGS: the program still builds
-   * and its visible surface is still retained, because refusing would strand
-   * anyone using a third-party .stlib they cannot rebuild. But a partial
-   * retain that nobody is told about is exactly the failure this reports.
+   * build. A library block the walk cannot follow is a compile WARNING: the
+   * program still builds, because refusing would strand a third-party .stlib
+   * nobody can rebuild. A RETAIN STRING(n) / WSTRING(n) the dispatch cannot
+   * store is `fatal`: that value would otherwise vanish at the next power
+   * cycle. `RETAIN on <library>` stays a warning.
    */
-  const incomplete: Array<{ path: string; reason: string }> = [];
+  const incomplete: Array<{ path: string; reason: string; fatal?: boolean }> =
+    [];
 
   const tail = (): Entry[] => arrays[arrays.length - 1]!;
 
@@ -578,7 +587,20 @@ export function generateDebugTable(
       ...(flags & LEAF_FLAG_RETAIN ? { retain: true as const } : {}),
     });
     if (flags & LEAF_FLAG_RETAIN) {
-      retainVars.push({ arrayIdx: arrIdx, elemIdx, path, size, tagName });
+      const key = iecName.toUpperCase();
+      const retainSize =
+        key === "STRING"
+          ? RETAIN_STRING_WIDTH
+          : key === "WSTRING"
+            ? RETAIN_WSTRING_WIDTH
+            : size;
+      retainVars.push({
+        arrayIdx: arrIdx,
+        elemIdx,
+        path,
+        size: retainSize,
+        tagName,
+      });
     }
   };
 
@@ -678,9 +700,28 @@ export function generateDebugTable(
             path,
             reason: `declared ${name}(${typeRef.maxLength}): the debugger needs the length as a number`,
           });
+        } else if ((flags & LEAF_FLAG_RETAIN) === 0) {
+          addLeaf(path, cppExpr, name, flags, typeRef.maxLength);
           return;
         }
-        addLeaf(path, cppExpr, name, flags, typeRef.maxLength);
+        if ((flags & LEAF_FLAG_RETAIN) !== 0) {
+          incomplete.push({
+            path,
+            fatal: true,
+            reason:
+              `RETAIN ${name}(${typeRef.maxLength}) is omitted from the retain ` +
+              `image. Retain addresses ${name}(${DISPATCH_STRING_CAPACITY}) only. ` +
+              `Declare a plain ${name}.`,
+          });
+          if (typeof typeRef.maxLength === "number") {
+            skipped.push({
+              path,
+              reason:
+                `declared ${name}(${typeRef.maxLength}), but retain addresses ` +
+                `${name}(${DISPATCH_STRING_CAPACITY}) only.`,
+            });
+          }
+        }
         return;
       }
       addLeaf(path, cppExpr, name, flags);

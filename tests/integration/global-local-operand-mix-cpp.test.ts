@@ -277,11 +277,9 @@ describeIfGpp("DOPE-613 — mixing a global and a local on a block input", () =>
       // changes what read() hands back — so prove the forced value still wins,
       // and that unforcing hands control back to writes.
       //
-      // Note the third step writes before reading. force() deliberately stores
-      // through to the raw value as well, so that plugins reading raw_ptr() see
-      // the forced value; unforce() only clears the flag. The canonical
-      // therefore still holds the forced value until something sets it again,
-      // and asserting a bare revert to 10 would be asserting the wrong contract.
+      // The third step writes before reading. force() does not clobber the
+      // underlying value; unforce() clears the flag and the previous value
+      // shows again. The explicit write pins that value before the last run.
       const out = run(
         program("ADD", "INT", "global+local"),
         [

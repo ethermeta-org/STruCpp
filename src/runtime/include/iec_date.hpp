@@ -32,9 +32,12 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
+#include <stdexcept>
 #include "iec_types.hpp"
 #include "iec_var.hpp"
 #include "iec_traits.hpp"
+#include "iec_fault.hpp"
 
 namespace strucpp {
 
@@ -93,8 +96,18 @@ inline IEC_DATE DATE_FROM_SECONDS(int64_t s) noexcept {
     return IEC_DATE(static_cast<DATE_t>(iec_floor_div(s, DATE_SECONDS_PER_DAY)));
 }
 
-inline int64_t DATE_TO_NS(IEC_DATE d) noexcept {
-    return iec_unwrap(d) * DATE_NS_PER_DAY;
+inline int64_t DATE_TO_NS(IEC_DATE d) {
+    const int64_t days = iec_unwrap(d);
+    const int64_t limit = std::numeric_limits<int64_t>::max() / DATE_NS_PER_DAY;
+    const int64_t floor = std::numeric_limits<int64_t>::min() / DATE_NS_PER_DAY;
+    if (days > limit || days < floor) {
+#if STRUCPP_HAS_EXCEPTIONS
+        throw std::overflow_error("DATE_TO_NS");
+#else
+        iec_runtime_fault(IecFault::NumericOverflow, "DATE_TO_NS");
+#endif
+    }
+    return days * DATE_NS_PER_DAY;
 }
 
 inline IEC_DATE DATE_FROM_NS(int64_t ns) noexcept {

@@ -42,6 +42,7 @@ enum class IecFault : uint8_t {
     NullReference = 0,  ///< Dereferenced a NULL IEC pointer/reference.
     ArrayBounds   = 1,  ///< IEC array index out of bounds.
     BadLocation   = 2,  ///< Invalid located-variable area/size character.
+    NumericOverflow = 3,  ///< Signed product does not fit in int64.
 };
 
 /**

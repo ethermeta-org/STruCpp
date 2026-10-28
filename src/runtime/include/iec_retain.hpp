@@ -82,8 +82,14 @@ namespace retain {
 // where it is scarce: a 4 KB EEPROM holds around a thousand retained DINTs.
 
 constexpr uint16_t MAGIC          = 0x4F52;
-constexpr uint8_t  FORMAT_VERSION = 1;
+/* Version 2 packs STRING/WSTRING at the IEC capacity, not the 126-unit
+ * debug window. The layout hash does not include widths, so this byte is
+ * what stops a version-1 blob from being unpacked into the wider slots.
+ * A mismatch is BadFormat: the host cold-starts. */
+constexpr uint8_t  FORMAT_VERSION = 2;
 constexpr uint16_t HEADER_SIZE    = 14;
+/** Payload length is stored as uint16. Larger layouts are refused, not truncated. */
+constexpr uint32_t PAYLOAD_MAX    = 65535u;
 
 /** Outcome of a load. Anything other than `Ok` leaves every variable at its
  *  declared initial value, which is the correct cold-start behaviour. */
@@ -181,10 +187,14 @@ inline uint32_t get_u32(const uint8_t* p) noexcept {
 // =============================================================================
 
 /** Packed payload size for this program's retained leaves. */
-inline size_t payload_size(SizeLeaf size_of) noexcept {
-    size_t total = 0;
+inline uint32_t payload_size(SizeLeaf size_of) noexcept {
+    uint32_t total = 0;
     for (uint16_t i = 0; i < debug::retain_var_count; ++i) {
-        total += size_of(debug::retain_vars[i].arr, debug::retain_vars[i].elem);
+        const uint32_t width = size_of(debug::retain_vars[i].arr, debug::retain_vars[i].elem);
+        if (width > PAYLOAD_MAX || total > PAYLOAD_MAX - width) {
+            return PAYLOAD_MAX + 1u;
+        }
+        total += width;
     }
     return total;
 }
@@ -193,9 +203,11 @@ inline size_t payload_size(SizeLeaf size_of) noexcept {
  * Total blob size, header included. Zero when nothing is retained — a host can
  * use that to skip the whole path, and a driver to skip provisioning storage.
  */
-inline size_t blob_size(SizeLeaf size_of) noexcept {
+inline uint32_t blob_size(SizeLeaf size_of) noexcept {
     if (debug::retain_var_count == 0) return 0;
-    return HEADER_SIZE + payload_size(size_of);
+    const uint32_t payload = payload_size(size_of);
+    if (payload > PAYLOAD_MAX) return 0;
+    return static_cast<uint32_t>(HEADER_SIZE) + payload;
 }
 
 // =============================================================================
@@ -212,8 +224,9 @@ inline size_t blob_size(SizeLeaf size_of) noexcept {
 inline size_t pack(uint8_t* out, size_t cap, ReadLeaf read_leaf, SizeLeaf size_of) noexcept {
     if (debug::retain_var_count == 0) return 0;
 
-    const size_t payload = payload_size(size_of);
-    const size_t total   = static_cast<size_t>(HEADER_SIZE) + payload;
+    const uint32_t payload = payload_size(size_of);
+    if (payload > PAYLOAD_MAX) return 0;
+    const uint32_t total = static_cast<uint32_t>(HEADER_SIZE) + payload;
     if (out == nullptr || cap < total) return 0;
 
     size_t at = HEADER_SIZE;
@@ -222,6 +235,7 @@ inline size_t pack(uint8_t* out, size_t cap, ReadLeaf read_leaf, SizeLeaf size_o
         const uint16_t elem  = debug::retain_vars[i].elem;
         const uint16_t width = size_of(arr, elem);
         if (width == 0) continue;
+        if (at > cap || static_cast<size_t>(width) > cap - at) return 0;
         // A short read leaves that leaf's bytes zeroed rather than aborting the
         // whole save: one unreadable leaf must not cost every other retained
         // value in the blob.

@@ -132,8 +132,8 @@ public:
 
     /**
      * Set the value.
-     * If forcing is active, the set is ignored to ensure drivers reading
-     * the raw storage always see the forced value for output variables.
+     * If forcing is active, the set is ignored. value_ stays the underlying
+     * value; readers that must observe the force use get() or read_ptr().
      */
     void set(T v) noexcept {
         if (!forced_) {
@@ -155,13 +155,14 @@ public:
 
     /**
      * Force the variable to a specific value.
-     * While forced, get() will return the forced value regardless of set() calls.
-     * Also updates the raw storage so drivers reading via raw_ptr() see the forced value.
+     * While forced, get() returns the forced value and set() is ignored.
+     * value_ is left unchanged so retain persists the underlying value and
+     * unforce restores it. Readers that must observe the force use get()
+     * or read_ptr(), not raw_ptr().
      */
     void force(T v) noexcept {
         forced_ = true;
         forced_value_ = v;
-        value_ = v;  // Update raw value so external readers (plugins) see forced value
     }
 
     /**
@@ -194,8 +195,9 @@ public:
      * Used by the runtime to bind located variables to I/O image tables.
      * Plugins and drivers read/write through this pointer.
      *
-     * For inputs: drivers write to this pointer, get() returns forced value when forced
-     * For outputs: force() updates this storage, so drivers always read the forced value
+     * For inputs: drivers write to this pointer, get() returns forced value when forced.
+     * For outputs: this stays the underlying value. A reader that must observe
+     * a force uses read_ptr() or get().
      */
     T* raw_ptr() noexcept { return &value_; }
 
@@ -207,11 +209,10 @@ public:
     /**
      * Get a const pointer to the value a READER should see, honouring force.
      *
-     * Not the same as raw_ptr(). force() writes through to value_, so the two
-     * agree the moment a force is applied — but a located variable is driven by
-     * the PLC program every scan, and the program writes value_ directly through
-     * the image binding, not through set(). raw_ptr() would then show the
-     * program's value while get() still reports the forced one.
+     * Not the same as raw_ptr(). force() stores the overlay in forced_value_
+     * and leaves value_ alone, so raw_ptr() keeps the underlying value while
+     * get() reports the force. A located variable is also written through
+     * raw_ptr() by the process image; that write does not clear the force.
      *
      * So this is get()'s semantics with get()'s copy removed, which is what an
      * external reader (the debug dispatch's pointer op, and through it OPC-UA)
