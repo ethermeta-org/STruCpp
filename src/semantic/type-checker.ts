@@ -1521,7 +1521,14 @@ export class TypeChecker {
     const lineage = fbLineage(upper, this.fbLookup);
     for (const fb of lineage) {
       if (this.ast?.functionBlocks.includes(fb) !== true) {
-        const library = this.symbolTables.lookupFunctionBlock(fb.name);
+        // A qualified name (`MC.MC_Power`) is one symbol. The declaration's
+        // own name is the bare leaf, which is ambiguous after a clash.
+        const leaf = fb.name.toUpperCase();
+        const qualified =
+          upper === leaf || upper.endsWith(`.${leaf}`) ? upper : fb.name;
+        const library =
+          this.symbolTables.lookupFunctionBlock(qualified) ??
+          this.symbolTables.lookupFunctionBlock(fb.name);
         for (const v of library?.inputs ?? []) addVar(v.name, "VAR_INPUT");
         for (const v of library?.outputs ?? []) addVar(v.name, "VAR_OUTPUT");
         for (const v of library?.inouts ?? []) addVar(v.name, "VAR_IN_OUT");
