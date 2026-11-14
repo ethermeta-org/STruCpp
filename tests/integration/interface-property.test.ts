@@ -184,6 +184,44 @@ END_PROGRAM
       "HOST_.ITF.get() != nullptr ? HOST_.ITF->get_SPEED()",
     );
   });
+
+  it("marks const only the getter of a block that implements the interface", () => {
+    const result = compile(`
+INTERFACE IRead
+    PROPERTY Speed : INT
+        GET
+        END_GET
+    END_PROPERTY
+END_INTERFACE
+FUNCTION_BLOCK ReadImpl IMPLEMENTS IRead
+VAR speedVal : INT; END_VAR
+    PROPERTY Speed : INT
+        GET Speed := speedVal; END_GET
+    END_PROPERTY
+END_FUNCTION_BLOCK
+FUNCTION_BLOCK Other
+VAR n : INT; END_VAR
+    PROPERTY Speed : INT
+        GET Speed := n; END_GET
+        SET n := Speed; END_SET
+    END_PROPERTY
+END_FUNCTION_BLOCK
+PROGRAM Main END_PROGRAM
+`);
+    expect(result.success).toBe(true);
+    const body = (header: string, name: string): string => {
+      const start = header.search(new RegExp(`class ${name}(?:\\s|[:{])`));
+      const next = header.indexOf("\nclass ", start + 1);
+      return start < 0 ? "" : header.slice(start, next < 0 ? undefined : next);
+    };
+    expect(body(result.headerCode, "READIMPL")).toContain("get_SPEED() const");
+    const other = body(result.headerCode, "OTHER");
+    expect(other).toContain("virtual IEC_INT get_SPEED();");
+    expect(other).not.toContain("get_SPEED() const");
+    expect(result.cppCode).toContain("IEC_INT READIMPL::get_SPEED() const");
+    expect(result.cppCode).toContain("IEC_INT OTHER::get_SPEED() {");
+    expect(result.cppCode).not.toContain("IEC_INT OTHER::get_SPEED() const");
+  });
 });
 
 describe.skipIf(!hasGpp)("Interface properties (g++ -std=c++14, run)", () => {

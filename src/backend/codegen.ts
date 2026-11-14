@@ -120,6 +120,7 @@ import {
   parseConversionName,
   QUERY_INTERFACE_FN,
   findInterfaceProperty,
+  collectImplementedInterfaces,
   type EnumMemberEntry,
 } from "../semantic/type-utils.js";
 import {
@@ -2173,7 +2174,7 @@ export class CodeGenerator {
     // Generate property declarations
     if (fb.properties.length > 0) {
       this.emitHeader("");
-      this.generatePropertyDeclarations(fb.properties);
+      this.generatePropertyDeclarations(fb.name, fb.properties);
     }
 
     // Virtual destructor (needed for classes with virtual methods)
@@ -2511,6 +2512,7 @@ export class CodeGenerator {
    * Generate property getter/setter declarations in the class header.
    */
   private generatePropertyDeclarations(
+    fbName: string,
     properties: PropertyDeclaration[],
   ): void {
     this.emitHeader("    // Properties");
@@ -2519,7 +2521,7 @@ export class CodeGenerator {
       this.emitHeaderLineDirective(prop.sourceSpan.startLine);
       const propLine = this.currentHeaderLine;
       if (prop.getter) {
-        const cnst = this.getterNeedsConst(prop.name) ? " const" : "";
+        const cnst = this.getterNeedsConst(fbName, prop.name) ? " const" : "";
         this.emitHeader(
           `    virtual ${types.value} get_${prop.name}()${cnst};`,
         );
@@ -2641,7 +2643,7 @@ export class CodeGenerator {
     if (prop.getter) {
       this.emitLineDirective(prop.sourceSpan.startLine);
       const getterLine = this.currentLine;
-      const cnst = this.getterNeedsConst(prop.name) ? " const" : "";
+      const cnst = this.getterNeedsConst(className, prop.name) ? " const" : "";
       this.emit(`${types.value} ${className}::get_${prop.name}()${cnst} {`);
       this.emitDebugFrameGuard(prop.getter);
       this.emit(`    ${types.value} ${prop.name}_result;`);
@@ -6146,17 +6148,22 @@ export class CodeGenerator {
   }
 
   /**
-   * An interface getter is `const`. The function block that supplies it
-   * must use the same signature or the override does not bind. A block
-   * with no interface property of this name keeps the non-const getter.
+   * An interface getter is `const`. Only a block that implements an
+   * interface with a readable property of this name (its own IMPLEMENTS,
+   * a base block's, or an interface EXTENDS parent) uses that signature,
+   * so the override binds. Another block's property of the same name
+   * does not make this getter const.
    */
-  private getterNeedsConst(propName: string): boolean {
+  private getterNeedsConst(fbName: string, propName: string): boolean {
+    const implemented = this.ast
+      ? collectImplementedInterfaces(this.ast, fbName)
+      : undefined;
+    if (implemented === undefined) return false;
     const upper = propName.toUpperCase();
-    for (const iface of this.ast?.interfaces ?? []) {
-      for (const prop of iface.properties) {
-        if (prop.name.toUpperCase() !== upper) continue;
-        if (prop.setter === undefined || prop.getter !== undefined) return true;
-      }
+    for (const ifaceName of implemented) {
+      const prop = findInterfaceProperty(this.ast, ifaceName, upper);
+      if (prop === undefined) continue;
+      if (prop.setter === undefined || prop.getter !== undefined) return true;
     }
     return false;
   }
