@@ -821,12 +821,18 @@ export class ASTBuilder {
   }
 
   /**
-   * Build a PropertyDeclaration from a propertyDeclaration CST node.
+   * Build a PropertyDeclaration from a propertyDeclaration or
+   * interfacePropertyDeclaration CST node.
    */
   buildPropertyDeclaration(node: CstNode): PropertyDeclaration {
     const children = node.children as CstChildren;
+    // FB properties name themselves with identifierOrKeyword. An interface
+    // property consumes Identifier directly. That token is a child of this
+    // node; a nested dataType's identifier is not.
     const nameNode = getFirstNode(children.identifierOrKeyword);
-    const name = nameNode ? getIdentifierOrKeywordImage(nameNode) : "";
+    const name = nameNode
+      ? getIdentifierOrKeywordImage(nameNode)
+      : (getFirstToken(children.Identifier)?.image ?? "");
 
     // Visibility modifier
     let visibility: Visibility = "PUBLIC";
