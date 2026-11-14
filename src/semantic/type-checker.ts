@@ -984,7 +984,12 @@ export class TypeChecker {
       this.checkMethodArguments(typeName, method, at);
     }
     if (method === undefined) {
-      if (this.declaredMembers(typeName)?.complete === true) {
+      // `pack.u()` is an instance call when `u` is a function block field,
+      // not a missing method of the struct.
+      if (
+        !this.structFieldIsFunctionBlock(typeName, methodName) &&
+        this.declaredMembers(typeName)?.complete === true
+      ) {
         this.addError(
           `'${typeName}' has no method '${methodName}'`,
           at.sourceSpan.startLine,
@@ -1464,6 +1469,24 @@ export class TypeChecker {
       );
       return;
     }
+  }
+
+  /**
+   * `pack.u()` calls the function block stored in field `u`. A field of
+   * another type is not that call.
+   */
+  private structFieldIsFunctionBlock(
+    typeName: string,
+    fieldName: string,
+  ): boolean {
+    const members = this.structMembers(typeName.toUpperCase());
+    if (!members?.vars.has(fieldName.toUpperCase()) || !this.ast) return false;
+    const fieldType = resolveFieldType(typeName, fieldName, this.ast);
+    if (!fieldType) return false;
+    return (
+      this.fbLookup(fieldType) !== undefined ||
+      this.symbolTables.lookupFunctionBlock(fieldType) !== undefined
+    );
   }
 
   /**
