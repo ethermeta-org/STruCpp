@@ -6148,22 +6148,52 @@ export class CodeGenerator {
   }
 
   /**
-   * An interface getter is `const`. Only a block that implements an
-   * interface with a readable property of this name (its own IMPLEMENTS,
-   * a base block's, or an interface EXTENDS parent) uses that signature,
-   * so the override binds. Another block's property of the same name
-   * does not make this getter const.
+   * An interface getter is `const`. The getter is const when this block
+   * or any block that EXTENDS it (directly or further) implements an
+   * interface with a readable property of this name. A block's own
+   * IMPLEMENTS, a base block's IMPLEMENTS, and an interface EXTENDS
+   * parent all count, so a derived block can inherit the getter without
+   * redeclaring the property and still override the const pure virtual.
+   * Another block's property of the same name does not make this getter
+   * const.
    */
   private getterNeedsConst(fbName: string, propName: string): boolean {
-    const implemented = this.ast
-      ? collectImplementedInterfaces(this.ast, fbName)
-      : undefined;
-    if (implemented === undefined) return false;
+    if (!this.ast) return false;
+    const blocks = this.ast.functionBlocks;
+    const children = new Map<string, string[]>();
+    for (const fb of blocks) {
+      const parent = fb.extends?.toUpperCase();
+      if (parent === undefined) continue;
+      const name = fb.name.toUpperCase();
+      const list = children.get(parent);
+      if (list) list.push(name);
+      else children.set(parent, [name]);
+    }
+
+    // This block, then every block whose EXTENDS chain reaches it.
+    const pending = [fbName.toUpperCase()];
+    const owners: string[] = [];
+    const seen = new Set<string>();
+    while (pending.length > 0) {
+      const name = pending.pop()!;
+      if (seen.has(name)) continue;
+      seen.add(name);
+      owners.push(name);
+      const kids = children.get(name);
+      if (kids) pending.push(...kids);
+    }
+
     const upper = propName.toUpperCase();
-    for (const ifaceName of implemented) {
-      const prop = findInterfaceProperty(this.ast, ifaceName, upper);
-      if (prop === undefined) continue;
-      if (prop.setter === undefined || prop.getter !== undefined) return true;
+    for (const name of owners) {
+      const implemented = collectImplementedInterfaces(this.ast, name);
+      if (implemented === undefined) continue;
+      for (const ifaceName of implemented) {
+        const prop = findInterfaceProperty(this.ast, ifaceName, upper);
+        if (prop === undefined) continue;
+        if (prop.setter === undefined || prop.getter !== undefined) {
+          return true;
+        }
+      }
     }
     return false;
   }

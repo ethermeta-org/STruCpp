@@ -222,6 +222,48 @@ PROGRAM Main END_PROGRAM
     expect(result.cppCode).toContain("IEC_INT OTHER::get_SPEED() {");
     expect(result.cppCode).not.toContain("IEC_INT OTHER::get_SPEED() const");
   });
+
+  it("marks the base getter const when a derived block implements the interface", () => {
+    const result = compile(`
+INTERFACE IRead
+    PROPERTY Speed : INT
+        GET
+        END_GET
+    END_PROPERTY
+END_INTERFACE
+FUNCTION_BLOCK Base
+VAR speedVal : INT; END_VAR
+    PROPERTY Speed : INT
+        GET Speed := speedVal; END_GET
+    END_PROPERTY
+END_FUNCTION_BLOCK
+FUNCTION_BLOCK Derived EXTENDS Base IMPLEMENTS IRead
+END_FUNCTION_BLOCK
+FUNCTION_BLOCK Other
+VAR n : INT; END_VAR
+    PROPERTY Speed : INT
+        GET Speed := n; END_GET
+    END_PROPERTY
+END_FUNCTION_BLOCK
+PROGRAM Main END_PROGRAM
+`);
+    expect(result.success).toBe(true);
+    const body = (header: string, name: string): string => {
+      const start = header.search(new RegExp(`class ${name}(?:\\s|[:{])`));
+      const next = header.indexOf("\nclass ", start + 1);
+      return start < 0 ? "" : header.slice(start, next < 0 ? undefined : next);
+    };
+    const base = body(result.headerCode, "BASE");
+    expect(base).toContain("virtual IEC_INT get_SPEED() const;");
+    expect(result.cppCode).toContain("IEC_INT BASE::get_SPEED() const");
+    const derived = body(result.headerCode, "DERIVED");
+    expect(derived).not.toContain("get_SPEED");
+    const other = body(result.headerCode, "OTHER");
+    expect(other).toContain("virtual IEC_INT get_SPEED();");
+    expect(other).not.toContain("get_SPEED() const");
+    expect(result.cppCode).toContain("IEC_INT OTHER::get_SPEED() {");
+    expect(result.cppCode).not.toContain("IEC_INT OTHER::get_SPEED() const");
+  });
 });
 
 describe.skipIf(!hasGpp)("Interface properties (g++ -std=c++14, run)", () => {
