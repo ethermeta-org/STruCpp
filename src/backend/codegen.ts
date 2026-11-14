@@ -6819,10 +6819,64 @@ export class CodeGenerator {
    * `isElementCall` distinguishes `units[0]()` from `units()`: there the
    * declared type is the array, so the instance type is its element type.
    */
+  /**
+   * `pack.u()` calls the function block stored in struct field `u`.
+   * The callee name is `pack.u`; the type is the field's, not that name.
+   * A method on a function block is not this call.
+   */
+  private structFieldInvocationType(functionName: string): string | undefined {
+    const dot = functionName.indexOf(".");
+    if (dot <= 0) return undefined;
+    const field = functionName.substring(dot + 1);
+    if (field.includes(".")) return undefined;
+    const owner = this.currentScopeVarTypes.get(
+      functionName.substring(0, dot).toUpperCase(),
+    );
+    if (owner === undefined) return undefined;
+    const ownerUpper = owner.toUpperCase();
+    if (
+      this.knownFBTypes.has(ownerUpper) ||
+      this.isInterfaceType(ownerUpper) ||
+      !this.knownStructTypes.has(ownerUpper)
+    ) {
+      return undefined;
+    }
+    const fieldType = this.resolveMemberType(owner, field);
+    if (fieldType === undefined) return undefined;
+    if (
+      this.isFBType(fieldType) ||
+      this.knownProgramTypes.has(fieldType.toUpperCase())
+    ) {
+      return fieldType;
+    }
+    return undefined;
+  }
+
+  /** C++ expression for `pack.u` when that call is a function-block instance. */
+  private structFieldInstanceCode(functionName: string): string | undefined {
+    if (this.structFieldInvocationType(functionName) === undefined) {
+      return undefined;
+    }
+    const dot = functionName.indexOf(".");
+    const base = functionName.substring(0, dot);
+    const field = functionName.substring(dot + 1);
+    const owner = this.currentScopeVarTypes.get(base.toUpperCase());
+    const fieldType = this.resolveMemberType(owner, field);
+    const fieldCpp = this.needsFieldMangling(field, fieldType, owner)
+      ? `${field}_`
+      : field;
+    const baseCode =
+      this.memberMangledNames.get(base.toUpperCase()) ??
+      this.resolveVariableBaseName(base);
+    return `${baseCode}.${fieldCpp}`;
+  }
+
   private getFBInvocationType(
     functionName: string,
     isElementCall = false,
   ): string | undefined {
+    const fieldType = this.structFieldInvocationType(functionName);
+    if (fieldType !== undefined) return fieldType;
     const declaredType = this.currentScopeVarTypes.get(
       functionName.toUpperCase(),
     );
@@ -6987,7 +7041,9 @@ export class CodeGenerator {
     const instanceName =
       call.instance !== undefined
         ? this.generateExpression(call.instance)
-        : (this.memberMangledNames.get(rawName.toUpperCase()) ?? rawName);
+        : (this.structFieldInstanceCode(call.functionName) ??
+          this.memberMangledNames.get(rawName.toUpperCase()) ??
+          rawName);
 
     // Extract implicit EN/ENO parameters
     const { enExpr, enoVar, filteredArgs } = this.extractEnEno(call.arguments);

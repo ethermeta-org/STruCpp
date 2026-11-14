@@ -1655,16 +1655,43 @@ export class TypeChecker {
     );
   }
 
+  /**
+   * `pack.u(...)` is a call of the function block stored in struct field
+   * `u`. Undefined for a method call, a qualified name, or any other callee.
+   */
+  private structFieldCallType(
+    expr: FunctionCallExpression,
+    scope: Scope,
+  ): string | undefined {
+    const dot = expr.functionName.indexOf(".");
+    if (dot <= 0 || this.ast === undefined) return undefined;
+    const field = expr.functionName.substring(dot + 1);
+    if (field.includes(".")) return undefined;
+    const prefix = expr.functionName.substring(0, dot);
+    const sym = scope.lookup(prefix);
+    if (sym?.kind !== "variable") return undefined;
+    const owner = sym.declaration?.type?.name;
+    if (owner === undefined || !this.structFieldIsFunctionBlock(owner, field)) {
+      return undefined;
+    }
+    return resolveFieldType(owner, field, this.ast);
+  }
+
   /** `fb(Name := ...)`: every named argument must be an input, output or in-out of the block. */
   private validateInstanceCallArgs(
     expr: FunctionCallExpression,
     scope: Scope,
   ): void {
-    const sym = scope.lookup(expr.functionName);
-    if (sym?.kind !== "variable") return;
-    const declType = sym.declaration?.type;
-    if (!declType || declType.arrayDimensions) return;
-    const members = this.declaredMembers(declType.name);
+    const fieldFb = this.structFieldCallType(expr, scope);
+    let declTypeName = fieldFb;
+    if (declTypeName === undefined) {
+      const sym = scope.lookup(expr.functionName);
+      if (sym?.kind !== "variable") return;
+      const declType = sym.declaration?.type;
+      if (!declType || declType.arrayDimensions) return;
+      declTypeName = declType.name;
+    }
+    const members = this.declaredMembers(declTypeName);
     if (members?.kind !== "functionBlock") return;
     for (const arg of expr.arguments) {
       if (arg.name === undefined) continue;
@@ -1680,8 +1707,8 @@ export class TypeChecker {
       }
       this.addError(
         kind === undefined
-          ? `'${declType.name}' has no input or output '${arg.name}'`
-          : `'${arg.name}' is not an input or output of '${declType.name}'`,
+          ? `'${declTypeName}' has no input or output '${arg.name}'`
+          : `'${arg.name}' is not an input or output of '${declTypeName}'`,
         arg.sourceSpan.startLine,
         arg.sourceSpan.startCol,
         arg.sourceSpan.file,
@@ -2254,11 +2281,15 @@ export class TypeChecker {
         .flatMap((d) => d.names.map((name) => ({ name, type: d.type })));
     const fn = this.findUserFunction(expr.functionName);
     if (fn) return fromBlocks(fn.varBlocks);
-    const sym = scope.lookup(expr.functionName);
-    if (sym?.kind !== "variable" || expr.instance) return undefined;
-    const declared = sym.declaration as VarDeclaration | undefined;
-    if (!declared) return undefined;
-    const typeName = declared.type.name.toUpperCase();
+    const fieldFb = this.structFieldCallType(expr, scope);
+    let typeName = fieldFb?.toUpperCase();
+    if (typeName === undefined) {
+      const sym = scope.lookup(expr.functionName);
+      if (sym?.kind !== "variable" || expr.instance) return undefined;
+      const declared = sym.declaration as VarDeclaration | undefined;
+      if (!declared) return undefined;
+      typeName = declared.type.name.toUpperCase();
+    }
     const localFBs = new Set(this.ast?.functionBlocks ?? []);
     const chain = fbLineage(typeName, this.fbLookup)
       .filter((fb) => localFBs.has(fb))

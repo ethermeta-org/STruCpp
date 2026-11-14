@@ -805,4 +805,47 @@ describe("motion FB instance single task", () => {
     expect(result.cppCode).toContain("AX = PWR.AXIS");
     expect(result.cppCode).toContain("PWR.AXIS = AX");
   });
+
+  it("compiles a struct-field call as a function-block instance", () => {
+    const result = compile(`
+      FUNCTION_BLOCK MC_Power
+        VAR_INPUT Enable : BOOL; END_VAR
+        VAR_IN_OUT Axis : INT; END_VAR
+      END_FUNCTION_BLOCK
+      TYPE Pack : STRUCT u : MC_Power; END_STRUCT END_TYPE
+      PROGRAM Main
+        VAR
+          shared : Pack;
+          ax : INT;
+        END_VAR
+        shared.u(Enable := TRUE, Axis := ax);
+      END_PROGRAM
+      CONFIGURATION Config0
+        RESOURCE Res0 ON PLC
+          TASK MainTask(INTERVAL := T#1ms, PRIORITY := 0);
+          PROGRAM INST0 WITH MainTask : Main;
+        END_RESOURCE
+      END_CONFIGURATION
+    `);
+    expect(result.errors).toEqual([]);
+    expect(result.cppCode).toContain("SHARED.U.ENABLE = true;");
+    expect(result.cppCode).toContain("SHARED.U.AXIS = AX;");
+    expect(result.cppCode).toContain("SHARED.U();");
+    expect(result.cppCode).toContain("AX = SHARED.U.AXIS;");
+    expect(result.cppCode).not.toContain("SHARED.U(true");
+    expect(result.cppCode).not.toContain("SHARED.U(AX");
+
+    const bad = errorsOf(`
+      FUNCTION_BLOCK MC_Power
+        VAR_INPUT Enable : BOOL; END_VAR
+      END_FUNCTION_BLOCK
+      TYPE Pack : STRUCT u : MC_Power; END_STRUCT END_TYPE
+      PROGRAM Main
+        VAR shared : Pack; END_VAR
+        shared.u(Nope := TRUE);
+      END_PROGRAM
+    `);
+    expect(bad.some((m) => m.includes("has no method"))).toBe(false);
+    expect(bad).toContain("'MC_POWER' has no input or output 'NOPE'");
+  });
 });
