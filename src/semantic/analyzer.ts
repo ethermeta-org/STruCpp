@@ -2015,6 +2015,12 @@ export class SemanticAnalyzer {
     const ifaceByName = new Map(
       ast.interfaces.map((i) => [i.name.toUpperCase(), i]),
     );
+    // Library interfaces are not in this AST. A local declaration of the
+    // same name wins; otherwise the loaded contract is what IMPLEMENTS checks.
+    for (const libIface of this.symbolTables.libraryInterfaces()) {
+      const key = libIface.name.toUpperCase();
+      if (!ifaceByName.has(key)) ifaceByName.set(key, libIface);
+    }
     for (const iface of ast.interfaces) {
       // CODESYS interface properties carry no executable logic. The grammar
       // tolerates accessor statements so the error can point at the source,
@@ -2090,6 +2096,33 @@ export class SemanticAnalyzer {
       }
       ifaceMap.set(iface.name.toUpperCase(), methodNames);
       ifacePropMap.set(iface.name.toUpperCase(), propByName);
+    }
+
+    // A consumer IMPLEMENTS a library interface that this unit does not
+    // redeclare. The closure walk above only runs for local interfaces, so
+    // fill the same maps for each loaded contract that is still missing.
+    for (const libIface of this.symbolTables.libraryInterfaces()) {
+      const root = libIface.name.toUpperCase();
+      if (ifaceMap.has(root)) continue;
+      const methodNames = new Set<string>();
+      const propByName = new Map<string, PropertyDeclaration>();
+      const visited = new Set<string>();
+      const queue = [root];
+      while (queue.length > 0) {
+        const name = queue.shift()!;
+        if (visited.has(name)) continue;
+        visited.add(name);
+        const it = ifaceByName.get(name);
+        if (!it) continue;
+        for (const m of it.methods) methodNames.add(m.name.toUpperCase());
+        for (const p of it.properties) {
+          const key = p.name.toUpperCase();
+          if (!propByName.has(key)) propByName.set(key, p);
+        }
+        for (const parent of it.extends ?? []) queue.push(parent.toUpperCase());
+      }
+      ifaceMap.set(root, methodNames);
+      ifacePropMap.set(root, propByName);
     }
 
     for (const fb of ast.functionBlocks) {
@@ -2244,6 +2277,67 @@ export class SemanticAnalyzer {
           }
         }
 
+        const typeLeaf = (name: string): string => {
+          const dot = name.lastIndexOf(".");
+          return (dot < 0 ? name : name.slice(dot + 1)).toUpperCase();
+        };
+        const methodShape = (method: MethodDeclaration): string => {
+          const ret = method.returnType ? typeLeaf(method.returnType.name) : "";
+          const params: string[] = [];
+          for (const block of method.varBlocks) {
+            if (
+              block.blockType !== "VAR_INPUT" &&
+              block.blockType !== "VAR_OUTPUT" &&
+              block.blockType !== "VAR_IN_OUT"
+            ) {
+              continue;
+            }
+            for (const decl of block.declarations) {
+              for (const paramName of decl.names) {
+                params.push(
+                  `${block.blockType}:${paramName.toUpperCase()}:${typeLeaf(decl.type.name)}`,
+                );
+              }
+            }
+          }
+          return `${ret}(${params.join(",")})`;
+        };
+        const requiredMethodDecl = (
+          root: string,
+          methodName: string,
+        ): MethodDeclaration | undefined => {
+          const seen = new Set<string>();
+          const queue = [root.toUpperCase()];
+          while (queue.length > 0) {
+            const name = queue.shift()!;
+            if (seen.has(name)) continue;
+            seen.add(name);
+            const iface = ifaceByName.get(name);
+            if (!iface) continue;
+            const found = iface.methods.find(
+              (method) => method.name.toUpperCase() === methodName,
+            );
+            if (found) return found;
+            for (const parent of iface.extends ?? []) {
+              queue.push(parent.toUpperCase());
+            }
+          }
+          return undefined;
+        };
+        const propertyTypesMatch = (
+          providedType: TypeReference,
+          requiredType: TypeReference,
+        ): boolean => {
+          if (propertyTypesEqual(providedType, requiredType)) return true;
+          const providedLeaf = typeLeaf(providedType.name);
+          const requiredLeaf = typeLeaf(requiredType.name);
+          if (providedLeaf !== requiredLeaf) return false;
+          return propertyTypesEqual(
+            { ...providedType, name: providedLeaf },
+            { ...requiredType, name: requiredLeaf },
+          );
+        };
+
         for (const ifaceName of requiredIfaces) {
           const inherited = !ownIfaces.has(ifaceName.toUpperCase())
             ? " (inherited contract)"
@@ -2264,6 +2358,18 @@ export class SemanticAnalyzer {
               if (provided.visibility !== "PUBLIC") {
                 this.addError(
                   `FUNCTION_BLOCK '${fb.name}' implements '${ifaceName}' but its method '${reqMethod}' is ${provided.visibility}; interface members must be implemented PUBLIC.`,
+                  provided.sourceSpan.startLine,
+                  provided.sourceSpan.startCol,
+                  provided.sourceSpan.file,
+                );
+              }
+              const requiredDecl = requiredMethodDecl(ifaceName, reqMethod);
+              if (
+                requiredDecl &&
+                methodShape(provided) !== methodShape(requiredDecl)
+              ) {
+                this.addError(
+                  `FUNCTION_BLOCK '${fb.name}' implements '${ifaceName}'${inherited} but method '${reqMethod}' has a different signature than the interface.`,
                   provided.sourceSpan.startLine,
                   provided.sourceSpan.startCol,
                   provided.sourceSpan.file,
@@ -2298,7 +2404,7 @@ export class SemanticAnalyzer {
                 }
                 continue;
               }
-              if (!propertyTypesEqual(provided.type, reqProp.type)) {
+              if (!propertyTypesMatch(provided.type, reqProp.type)) {
                 const plainNames =
                   formatPropertyType(provided.type) === provided.type.name &&
                   formatPropertyType(reqProp.type) === reqProp.type.name;

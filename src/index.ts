@@ -209,10 +209,18 @@ function collectUsedSymbols(
       }
       case "FunctionBlockDeclaration": {
         const fbd = node as FunctionBlockDeclaration;
-        if (fbd.extends) referencedNames.add(fbd.extends.toUpperCase());
+        if (fbd.extends) {
+          referencedNames.add(fbd.extends.toUpperCase());
+          addLibraryQualifiedName(
+            fbd.extends,
+            referencedNames,
+            symbolByNamespace,
+          );
+        }
         if (fbd.implements) {
           for (const iface of fbd.implements) {
             referencedNames.add(iface.toUpperCase());
+            addLibraryQualifiedName(iface, referencedNames, symbolByNamespace);
           }
         }
         break;
@@ -222,6 +230,7 @@ function collectUsedSymbols(
         if (id.extends) {
           for (const base of id.extends) {
             referencedNames.add(base.toUpperCase());
+            addLibraryQualifiedName(base, referencedNames, symbolByNamespace);
           }
         }
         break;
@@ -1396,6 +1405,14 @@ export type {
   LibraryFunctionEntry,
   LibraryFBEntry,
   LibraryTypeEntry,
+  LibraryInterfaceEntry,
+  LibraryPropertyAccess,
+} from "./library/library-manifest.js";
+export {
+  LIBRARY_CHUNK_KIND_INTERFACE,
+  LIBRARY_PROPERTY_ACCESS_READONLY,
+  LIBRARY_PROPERTY_ACCESS_READWRITE,
+  LIBRARY_PROPERTY_ACCESS_WRITEONLY,
 } from "./library/library-manifest.js";
 
 // Re-export CODESYS import

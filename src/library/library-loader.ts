@@ -318,16 +318,40 @@ export function libraryInterfaceDeclarations(
   manifest: LibraryManifest,
 ): InterfaceDeclaration[] {
   const sourceSpan = { ...createDefaultSourceSpan(), file: manifest.name };
-  return (manifest.interfaces ?? []).map((i: LibraryInterfaceEntry) => ({
+  const entries = manifest.interfaces ?? [];
+  const localNames = new Set(entries.map((entry) => entry.name.toUpperCase()));
+  const namespace = manifest.namespace;
+  const one = (
+    entry: LibraryInterfaceEntry,
+    name: string,
+    extendsNames: string[] | undefined,
+  ): InterfaceDeclaration => ({
     kind: "InterfaceDeclaration",
     sourceSpan,
-    name: i.name,
-    ...(i.attributes !== undefined ? { attributes: i.attributes } : {}),
-    ...(i.extends !== undefined ? { extends: i.extends } : {}),
-    methods: i.methods.map((m) => ({ ...makeMethod(m), sourceSpan })),
-    properties: i.properties.map((p) => ({ ...makeProperty(p), sourceSpan })),
+    name,
+    ...(entry.attributes !== undefined ? { attributes: entry.attributes } : {}),
+    ...(extendsNames !== undefined && extendsNames.length > 0
+      ? { extends: extendsNames }
+      : {}),
+    methods: entry.methods.map((m) => ({ ...makeMethod(m), sourceSpan })),
+    properties: entry.properties.map((p) => ({
+      ...makeProperty(p),
+      sourceSpan,
+    })),
     library: manifest.name,
-  }));
+  });
+  const decls: InterfaceDeclaration[] = [];
+  for (const entry of entries) {
+    decls.push(one(entry, entry.name, entry.extends));
+    if (namespace.length === 0) continue;
+    const qualifiedExtends = entry.extends?.map((parent) => {
+      if (parent.includes(".")) return parent;
+      if (localNames.has(parent.toUpperCase())) return `${namespace}.${parent}`;
+      return parent;
+    });
+    decls.push(one(entry, `${namespace}.${entry.name}`, qualifiedExtends));
+  }
+  return decls;
 }
 
 function makeVarSymbol(
@@ -680,6 +704,11 @@ export function loadLibraryManifest(json: unknown): LibraryManifest {
     }
   }
 
+  if (obj.interfaces !== undefined && !Array.isArray(obj.interfaces)) {
+    throw new LibraryManifestError(
+      "Invalid library manifest: 'interfaces' must be an array",
+    );
+  }
   const interfaces: LibraryInterfaceEntry[] = [];
   if (Array.isArray(obj.interfaces)) {
     obj.interfaces.forEach((itf: unknown, i) => {
@@ -708,9 +737,7 @@ export function loadLibraryManifest(json: unknown): LibraryManifest {
   if (Array.isArray(obj.globals)) {
     result.globals = globals;
   }
-  if (Array.isArray(obj.interfaces)) {
-    result.interfaces = interfaces;
-  }
+  result.interfaces = interfaces;
   if (obj.description !== undefined) {
     result.description = String(obj.description);
   }
@@ -802,7 +829,8 @@ function storeQualifiedLibrarySymbol(
 
 /**
  * Register a library's symbols into the compiler's symbol tables.
- * This makes library functions, FBs, and types available for semantic analysis.
+ * This makes library functions, FBs, types, and interfaces available
+ * for semantic analysis.
  */
 export function registerLibrarySymbols(
   manifest: LibraryManifest,
@@ -935,6 +963,30 @@ export function registerLibrarySymbols(
       manifest.namespace,
       manifest.name,
     );
+  }
+
+  // Interfaces are types (a variable may name one) and contracts (an
+  // IMPLEMENTS clause is checked against the methods and properties).
+  for (const iface of manifest.interfaces ?? []) {
+    defineLibrarySymbol(
+      symbolTables,
+      {
+        name: iface.name,
+        kind: "type",
+        declaration:
+          undefined as unknown as import("../frontend/ast.js").TypeDeclaration,
+        resolvedType: {
+          typeKind: "elementary",
+          name: iface.name,
+          sizeBits: 0,
+        } as ElementaryType,
+      },
+      manifest.namespace,
+      manifest.name,
+    );
+  }
+  for (const decl of libraryInterfaceDeclarations(manifest)) {
+    symbolTables.addLibraryInterface(decl);
   }
 
   // Register exported global variables into the shared global scope. Because

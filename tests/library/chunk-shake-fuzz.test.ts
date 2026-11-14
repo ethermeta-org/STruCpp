@@ -63,6 +63,7 @@ function programReferencing(chunk: { kind: string; name: string }): string {
     case "functionBlock":
       return `PROGRAM Main\n  VAR inst : ${chunk.name}; END_VAR\nEND_PROGRAM\n`;
     case "type":
+    case "interface":
       return `PROGRAM Main\n  VAR v : ${chunk.name}; END_VAR\nEND_PROGRAM\n`;
     default:
       throw new Error(`programReferencing not implemented for ${chunk.kind}`);

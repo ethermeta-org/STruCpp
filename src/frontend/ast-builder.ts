@@ -589,22 +589,22 @@ export class ASTBuilder {
     const isAbstract = !!children.ABSTRACT;
     const isFinal = !!children.FINAL;
 
-    // Remaining Identifier tokens are for EXTENDS and IMPLEMENTS clauses
-    const allIdentifiers = getAllTokens(children.Identifier);
+    const qualified = getAllNodes(children.qualifiedIdentifier).map((qid) =>
+      this.buildQualifiedIdentifier(qid).join("."),
+    );
+    let qualifiedIdx = 0;
 
     // Check for EXTENDS clause
     let extendsName: string | undefined;
     if (children.EXTENDS) {
-      // The identifier after EXTENDS is the first Identifier token
-      extendsName = allIdentifiers[0]?.image;
+      extendsName = qualified[qualifiedIdx];
+      qualifiedIdx += 1;
     }
 
-    // Check for IMPLEMENTS clause (identifiers after IMPLEMENTS keyword)
+    // Check for IMPLEMENTS clause
     let implementsList: string[] | undefined;
     if (children.IMPLEMENTS) {
-      // Skip the EXTENDS identifier if present
-      const startIdx = extendsName ? 1 : 0;
-      const implNames = allIdentifiers.slice(startIdx).map((t) => t.image);
+      const implNames = qualified.slice(qualifiedIdx);
       if (implNames.length > 0) {
         implementsList = implNames;
       }
@@ -662,10 +662,12 @@ export class ASTBuilder {
     const allIdentifiers = getAllTokens(children.Identifier);
     const name = allIdentifiers[0]?.image ?? "";
 
-    // Check for EXTENDS clause
+    // Check for EXTENDS clause. Names may be library-qualified.
     let extendsList: string[] | undefined;
     if (children.EXTENDS) {
-      const extNames = allIdentifiers.slice(1).map((t) => t.image);
+      const extNames = getAllNodes(children.qualifiedIdentifier).map((qid) =>
+        this.buildQualifiedIdentifier(qid).join("."),
+      );
       if (extNames.length > 0) {
         extendsList = extNames;
       }

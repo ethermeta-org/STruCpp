@@ -133,17 +133,17 @@ export class STParser extends CstParser {
         this.CONSUME(tokens.FINAL);
       });
       this.SUBRULE(this.identifierOrKeyword);
-      // Optional EXTENDS clause
+      // Optional EXTENDS clause. One library qualification: NS.Name.
       this.OPTION2(() => {
         this.CONSUME(tokens.EXTENDS);
-        this.CONSUME2(tokens.Identifier);
+        this.SUBRULE(this.qualifiedIdentifier);
       });
-      // Optional IMPLEMENTS clause
+      // Optional IMPLEMENTS clause. Each name may be NS.Name.
       this.OPTION3(() => {
         this.CONSUME(tokens.IMPLEMENTS);
         this.AT_LEAST_ONE_SEP({
           SEP: tokens.Comma,
-          DEF: () => this.CONSUME3(tokens.Identifier),
+          DEF: () => this.SUBRULE2(this.qualifiedIdentifier),
         });
       });
       // VAR blocks, methods, properties interleaved (before body)
@@ -184,12 +184,12 @@ export class STParser extends CstParser {
   public interfaceDeclaration = this.RULE("interfaceDeclaration", () => {
     this.CONSUME(tokens.INTERFACE);
     this.CONSUME(tokens.Identifier);
-    // Optional EXTENDS clause (interface inheritance)
+    // Optional EXTENDS clause (interface inheritance). Each name may be NS.Name.
     this.OPTION(() => {
       this.CONSUME(tokens.EXTENDS);
       this.AT_LEAST_ONE_SEP({
         SEP: tokens.Comma,
-        DEF: () => this.CONSUME2(tokens.Identifier),
+        DEF: () => this.SUBRULE(this.qualifiedIdentifier),
       });
     });
     // Interface members: abstract methods and statement-free properties

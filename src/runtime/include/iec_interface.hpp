@@ -103,6 +103,9 @@ public:
         if (value == 0) ptr_ = nullptr;
     }
 
+    /** `itf := NULL`. Same unbound state as `itf := 0`. */
+    void bind(std::nullptr_t) noexcept { ptr_ = nullptr; }
+
     /**
      * Assign a related interface reference. The copy assignment stays the
      * non-template one; this is only the upcast (`I := J` when J extends I).
@@ -121,6 +124,11 @@ public:
                   std::is_integral<N>::value>::type>
     IEC_ITF& operator=(N value) noexcept {
         if (value == 0) ptr_ = nullptr;
+        return *this;
+    }
+
+    IEC_ITF& operator=(std::nullptr_t) noexcept {
+        ptr_ = nullptr;
         return *this;
     }
 
@@ -154,6 +162,9 @@ public:
         return !(*this == value);
     }
 
+    bool operator==(std::nullptr_t) const noexcept { return ptr_ == nullptr; }
+    bool operator!=(std::nullptr_t) const noexcept { return ptr_ != nullptr; }
+
     /** Raw interface pointer; nullptr when unbound. */
     T* get() const { return ptr_; }
 
@@ -179,6 +190,16 @@ template <typename N, typename T,
           typename = typename std::enable_if<std::is_integral<N>::value>::type>
 bool operator!=(N value, const IEC_ITF<T>& itf) noexcept {
     return itf != value;
+}
+
+/** `NULL = itf` and `NULL <> itf`. */
+template <typename T>
+bool operator==(std::nullptr_t, const IEC_ITF<T>& itf) noexcept {
+    return itf == nullptr;
+}
+template <typename T>
+bool operator!=(std::nullptr_t, const IEC_ITF<T>& itf) noexcept {
+    return itf != nullptr;
 }
 
 }  // namespace strucpp

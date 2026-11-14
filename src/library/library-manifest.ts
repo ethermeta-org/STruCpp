@@ -171,6 +171,8 @@ export interface LibraryPropertyEntry {
   visibility: LibraryVisibility;
   getter?: true;
   setter?: true;
+  /** Direction of an interface property. Absent on function-block properties. */
+  access?: LibraryPropertyAccess;
 }
 
 /** An exported interface. */
@@ -185,6 +187,8 @@ export interface LibraryInterfaceEntry {
   properties: LibraryPropertyEntry[];
   /** Folder path within the library — see `LibraryFunctionEntry.category`. */
   category?: string;
+  /** Same omit-when-empty contract as `LibraryFBEntry.documentation`. */
+  documentation?: string;
 }
 
 /**
@@ -306,6 +310,27 @@ export interface LibraryTypeEntry {
 }
 
 /**
+ * Property direction on a library interface.
+ *
+ * Taken from the interface text alone: no accessor is read-write, a GET
+ * accessor (body empty) is read-only, a SET accessor (body empty) is
+ * write-only. Both accessors present is read-write. Names only, with the
+ * direction dropped, are not a usable export.
+ */
+export const LIBRARY_PROPERTY_ACCESS_READWRITE = "readwrite";
+export const LIBRARY_PROPERTY_ACCESS_READONLY = "readonly";
+export const LIBRARY_PROPERTY_ACCESS_WRITEONLY = "writeonly";
+export const LIBRARY_PROPERTY_ACCESS = [
+  LIBRARY_PROPERTY_ACCESS_READWRITE,
+  LIBRARY_PROPERTY_ACCESS_READONLY,
+  LIBRARY_PROPERTY_ACCESS_WRITEONLY,
+] as const;
+export type LibraryPropertyAccess = (typeof LIBRARY_PROPERTY_ACCESS)[number];
+
+/** Chunk kind for an INTERFACE. Old archives omit it. */
+export const LIBRARY_CHUNK_KIND_INTERFACE = "interface";
+
+/**
  * Library global-variable entry in a manifest.
  *
  * One per name declared in a library's `VAR_GLOBAL` blocks (e.g. OSCAT's
@@ -360,7 +385,9 @@ export interface LibraryManifest {
    *  Optional for backward compatibility with archives compiled before
    *  globals were exported — consumers treat a missing field as empty. */
   globals?: LibraryGlobalEntry[];
-  /** Exported interfaces. Optional for archives built before interfaces were exported. */
+  /** Exported interfaces. Absent on an archive compiled before interfaces
+   *  were exported — loaders treat that as an empty list and still load
+   *  the library. A present field is validated; it is not dropped. */
   interfaces?: LibraryInterfaceEntry[];
   /** C++ headers to include */
   headers: string[];
@@ -393,7 +420,7 @@ export interface LibraryChunkDep {
  * Per-symbol chunk in a compiled library.
  *
  * One chunk per top-level declaration: function, function block, type
- * (struct/enum/alias group), or inline global. `header` + `cpp`
+ * (struct/enum/alias group), interface, or inline global. `header` + `cpp`
  * concatenated in chunk-array order reproduce the legacy library-wide
  * header/cpp blobs — the chunked form is a refinement, not a rewrite,
  * of what the codegen used to emit as one chunk per library.
@@ -407,12 +434,17 @@ export interface LibraryChunkDep {
 export interface LibraryChunk {
   /** Symbol name (uppercase). Matches an entry in
    *  `manifest.functions`, `manifest.functionBlocks`, `manifest.types`,
-   *  or names an inline global owned by this library. */
+   *  `manifest.interfaces`, or names an inline global owned by this library. */
   name: string;
   /** Top-level kind. Drives forward-decl ordering during emission
-   *  (function blocks need forward decls so circular FB-to-FB
+   *  (function blocks and interfaces need forward decls so circular
    *  references resolve; types and functions don't). */
-  kind: "function" | "functionBlock" | "type" | "inlineGlobal";
+  kind:
+    | "function"
+    | "functionBlock"
+    | "type"
+    | "inlineGlobal"
+    | typeof LIBRARY_CHUNK_KIND_INTERFACE;
   /** Slice of this library's emitted header code that declares this
    *  symbol — class declaration, struct body, function prototype, or
    *  inline-global definition — plus any same-line `using IEC_X = X;`

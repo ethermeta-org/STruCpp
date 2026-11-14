@@ -120,6 +120,63 @@ END_CONFIGURATION
     expect(addr.size).toBe(8);
   });
 
+  it("skips an interface-typed member instead of throwing", () => {
+    // Interfaces are type symbols with no definition. Expanding one used to
+    // throw TypeError inside visitTypeRef and drop the whole debug table.
+    const source = `
+INTERFACE IBehaviourModel
+  METHOD StartModel : BOOL
+  END_METHOD
+END_INTERFACE
+
+FUNCTION_BLOCK Host
+  VAR
+    model : IBehaviourModel;
+    ticks : INT;
+  END_VAR
+END_FUNCTION_BLOCK
+
+TYPE Point : STRUCT x : INT; END_STRUCT END_TYPE
+
+PROGRAM main
+  VAR
+    host : Host;
+    pt : Point;
+  END_VAR
+END_PROGRAM
+
+CONFIGURATION Config0
+  RESOURCE Res0 ON PLC
+    TASK task0(INTERVAL := T#20ms, PRIORITY := 1);
+    PROGRAM instance0 WITH task0 : main;
+  END_RESOURCE
+END_CONFIGURATION
+`;
+    const result = compile(source);
+    expect(result.errors.map((e) => e.message)).toEqual([]);
+    expect(result.success).toBe(true);
+
+    const paths = result.debugMap!.leaves.map((l) => l.path);
+    expect(paths).toContain("INSTANCE0.HOST.TICKS");
+    expect(paths).toContain("INSTANCE0.PT.X");
+    expect(
+      paths.some(
+        (p) =>
+          p === "INSTANCE0.HOST.MODEL" ||
+          p.startsWith("INSTANCE0.HOST.MODEL."),
+      ),
+    ).toBe(false);
+    expect(paths.some((p) => p.includes("STARTMODEL"))).toBe(false);
+    expect(result.debugTableCpp).not.toContain("INSTANCE0.HOST.MODEL");
+
+    const warning = result.warnings.find((w) =>
+      w.message.includes("INSTANCE0.HOST.MODEL"),
+    );
+    expect(warning?.message).toContain(
+      "interface reference IBEHAVIOURMODEL is not expanded",
+    );
+  });
+
   it("emits Entry rows for STRING and WSTRING leaves with the wire-width sizes", () => {
     const source = `
 PROGRAM main

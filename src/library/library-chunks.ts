@@ -22,6 +22,7 @@ import type {
   LibraryManifest,
   StlibArchive,
 } from "./library-manifest.js";
+import { LIBRARY_CHUNK_KIND_INTERFACE } from "./library-manifest.js";
 
 type ChunkKind = LibraryChunk["kind"];
 
@@ -43,6 +44,7 @@ const KNOWN_KINDS: ReadonlySet<string> = new Set([
   "functionBlock",
   "type",
   "inlineGlobal",
+  LIBRARY_CHUNK_KIND_INTERFACE,
 ]);
 
 function isChunkKind(s: string): s is ChunkKind {
@@ -180,6 +182,9 @@ function populateManifestSymbols(
   for (const t of manifest.types) {
     ownership.set(t.name.toUpperCase(), libraryName);
   }
+  for (const iface of manifest.interfaces ?? []) {
+    ownership.set(iface.name.toUpperCase(), libraryName);
+  }
 }
 
 /**
@@ -278,13 +283,13 @@ function computeChunkDeps(
     }
     case "type": {
       const t = ast.types.find((td) => td.name === name);
-      if (t) {
-        collectReferencedNames(t as unknown as ASTNode, referenced);
-      } else {
-        const iface = ast.interfaces.find((i) => i.name === name);
-        if (iface)
-          collectReferencedNames(iface as unknown as ASTNode, referenced);
-      }
+      if (t) collectReferencedNames(t as unknown as ASTNode, referenced);
+      break;
+    }
+    case "interface": {
+      const iface = ast.interfaces.find((i) => i.name === name);
+      if (iface)
+        collectReferencedNames(iface as unknown as ASTNode, referenced);
       break;
     }
     case "inlineGlobal": {

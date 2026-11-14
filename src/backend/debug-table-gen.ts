@@ -527,8 +527,6 @@ export function generateDebugTable(
     tagName: TagName;
   }> = [];
   const skipped: Array<{ path: string; reason: string }> = [];
-  const INTERFACE_REASON =
-    "an interface variable holds a reference to an instance, which the debugger cannot show or write.";
   const INTERFACE_ARRAY_REASON =
     "each element is an interface variable, which holds a reference to an instance the debugger cannot show or write.";
   /**
@@ -682,7 +680,10 @@ export function generateDebugTable(
     const name = typeRef.name.toUpperCase();
 
     if (interfaceNames.has(name)) {
-      skipped.push({ path, reason: INTERFACE_REASON });
+      skipped.push({
+        path,
+        reason: `interface reference ${typeRef.name} is not expanded`,
+      });
       return;
     }
 
@@ -732,6 +733,22 @@ export function generateDebugTable(
     // types (struct/enum/alias). The symbol table is the unified source.
     const ts = symbolTables.lookupType(name);
     if (ts) {
+      // Interfaces are registered as type symbols with `declaration` left
+      // empty. Reading `.definition` threw TypeError and aborted the table
+      // for every CONFIGURATION that instantiated such a member. An interface
+      // has no fields; a symbol with no definition has nothing to walk either.
+      // shortcut: library interfaces match the empty declaration, not by name; upgrade when one carries a definition.
+      if (
+        interfaceNames.has(name) ||
+        ts.declaration == null ||
+        ts.declaration.definition == null
+      ) {
+        skipped.push({
+          path,
+          reason: `interface reference ${typeRef.name} is not expanded`,
+        });
+        return;
+      }
       const def = ts.declaration.definition;
       if (def.kind === "StructDefinition") {
         visitStructFields(path, cppExpr, def, flags);

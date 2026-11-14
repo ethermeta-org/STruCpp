@@ -22,6 +22,7 @@ import type {
 } from "../frontend/ast.js";
 import { TypeRegistry, isElementaryType } from "../semantic/type-registry.js";
 import {
+  cppScopedName,
   formatArrayType,
   formatIntegerLiteral,
   translateIECString,
@@ -367,7 +368,7 @@ export class TypeCodeGenerator {
       const rawType = field.type.arrayDimensions
         ? cppType
         : this.options.isInterfaceType(field.type.name)
-          ? `IEC_ITF<${field.type.name}>`
+          ? `IEC_ITF<${cppScopedName(field.type.name)}>`
           : this.mapTypeToCpp(field.type.name);
       cppType = isReferenceField(field.type)
         ? // REF_TO / REFERENCE TO: the same wrapper a variable gets.
@@ -549,21 +550,21 @@ export class TypeCodeGenerator {
     if (def.arrayDimensions && def.elementTypeName) {
       // POINTER TO ARRAY[...] OF T — use array template
       const elemBase = this.options.isInterfaceType(def.elementTypeName)
-        ? `IEC_ITF<${def.elementTypeName}>`
+        ? `IEC_ITF<${cppScopedName(def.elementTypeName)}>`
         : this.mapTypeToCpp(def.elementTypeName);
       const elemCpp = def.elementReferenceChain
         ? wrapReferenceChain(def.elementReferenceChain, elemBase)
         : elemBase;
       cppType = formatArrayType(elemCpp, def.arrayDimensions);
     } else if (this.options.isInterfaceType(def.name)) {
-      cppType = `IEC_ITF<${def.name}>`;
+      cppType = `IEC_ITF<${cppScopedName(def.name)}>`;
     } else {
       cppType = this.mapTypeToCpp(def.name);
     }
     const rawType = def.arrayDimensions
       ? cppType
       : this.options.isInterfaceType(def.name)
-        ? `IEC_ITF<${def.name}>`
+        ? `IEC_ITF<${cppScopedName(def.name)}>`
         : this.mapTypeToCpp(def.name);
     cppType = isReferenceField(def)
       ? wrapReferenceChain(def.referenceChain ?? [def.referenceKind], rawType)
@@ -583,7 +584,7 @@ export class TypeCodeGenerator {
     maxLength?: number | string,
   ): string {
     const inner = this.options.isInterfaceType(typeName)
-      ? `IEC_ITF<${typeName}>`
+      ? `IEC_ITF<${cppScopedName(typeName)}>`
       : this.mapTypeToCpp(typeName);
     return referenceChain
       ? wrapReferenceChain(referenceChain, inner)
@@ -616,7 +617,7 @@ export class TypeCodeGenerator {
     const upperName = typeName.toUpperCase();
 
     if (this.options.isInterfaceType(typeName)) {
-      return `IEC_ITF<${typeName}>`;
+      return `IEC_ITF<${cppScopedName(typeName)}>`;
     }
 
     // STRING/WSTRING with optional length → IECStringVar/IECWStringVar (forceable)

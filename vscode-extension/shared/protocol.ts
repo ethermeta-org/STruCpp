@@ -139,7 +139,12 @@ export interface LibraryArchiveInfo {
     };
     chunks: Array<{
       name: string;
-      kind: "function" | "functionBlock" | "type" | "inlineGlobal";
+      kind:
+        | "function"
+        | "functionBlock"
+        | "type"
+        | "inlineGlobal"
+        | "interface";
       header: string;
       cpp: string;
       deps: Array<{ library: string; name: string }>;

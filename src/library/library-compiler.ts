@@ -15,6 +15,9 @@ import type {
 import { transpileILSource } from "../il/il-transpiler.js";
 import {
   HEADER_NAME_RE,
+  LIBRARY_PROPERTY_ACCESS_READONLY,
+  LIBRARY_PROPERTY_ACCESS_READWRITE,
+  LIBRARY_PROPERTY_ACCESS_WRITEONLY,
   STLIB_INTERNAL_FORMAT_VERSION,
 } from "./library-manifest.js";
 import { compile } from "../index.js";
@@ -39,6 +42,7 @@ import type {
   LibraryInterfaceEntry,
   LibraryManifest,
   LibraryMethodEntry,
+  LibraryPropertyAccess,
   LibraryPropertyEntry,
   LibraryTypeRef,
   LibraryVarType,
@@ -269,7 +273,10 @@ function serializeInterface(
     ...attributesOf(i),
     ...(i.extends && i.extends.length > 0 ? { extends: i.extends } : {}),
     methods: i.methods.map((m) => serializeMethod(m, text)),
-    properties: i.properties.map((p) => serializeProperty(p, text)),
+    properties: i.properties.map((p) => ({
+      ...serializeProperty(p, text),
+      access: interfacePropertyAccess(p),
+    })),
   };
 }
 
@@ -321,7 +328,7 @@ function serializeLocal(
 
 /** Match a top-of-line POU header. */
 const POU_HEADER_RE =
-  /^[ \t]*(FUNCTION_BLOCK|FUNCTION|PROGRAM|TYPE)[ \t]+(\w+)/gm;
+  /^[ \t]*(FUNCTION_BLOCK|FUNCTION|PROGRAM|TYPE|INTERFACE)[ \t]+(\w+)/gm;
 
 /**
  * Build a "POU name → category" map from categorized source inputs.
@@ -447,9 +454,28 @@ function emptyManifest(options: {
     functions: [],
     functionBlocks: [],
     types: [],
+    interfaces: [],
     headers: [],
     isBuiltin: false,
   };
+}
+
+/**
+ * Access direction of an interface property.
+ *
+ * No accessor, or both, is read-write. A lone GET is read-only. A lone SET
+ * is write-only. The accessor body is irrelevant: interface properties have
+ * none.
+ */
+function interfacePropertyAccess(prop: {
+  getter?: unknown;
+  setter?: unknown;
+}): LibraryPropertyAccess {
+  const hasGet = prop.getter !== undefined;
+  const hasSet = prop.setter !== undefined;
+  if (hasGet && !hasSet) return LIBRARY_PROPERTY_ACCESS_READONLY;
+  if (!hasGet && hasSet) return LIBRARY_PROPERTY_ACCESS_WRITEONLY;
+  return LIBRARY_PROPERTY_ACCESS_READWRITE;
 }
 
 /**
@@ -638,6 +664,7 @@ function findDuplicateExports(manifest: LibraryManifest): string[] {
     );
   }
   for (const type of manifest.types) claim(type.name, "type");
+  for (const iface of manifest.interfaces ?? []) claim(iface.name, "interface");
   for (const global of manifest.globals ?? [])
     claim(global.name, "global variable");
 
@@ -763,6 +790,7 @@ export function compileLibrary(
         functions: [],
         functionBlocks: [],
         types: [],
+        interfaces: [],
         headers: [],
         isBuiltin: false,
         sourceFiles: sources.map((s) => s.fileName),
@@ -877,7 +905,12 @@ export function compileLibrary(
     ],
     interfaces: ast.interfaces
       .filter((i) => i.library === undefined)
-      .map((i) => tagCategory(serializeInterface(i, text), catByName)),
+      .map((i) =>
+        tagDocumentation(
+          tagCategory(serializeInterface(i, text), catByName),
+          docByName,
+        ),
+      ),
     types: ast.types.map((t) => {
       const kind: "struct" | "enum" | "alias" =
         t.definition.kind === "StructDefinition"

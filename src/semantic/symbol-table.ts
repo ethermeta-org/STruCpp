@@ -10,6 +10,7 @@
 import type {
   FunctionDeclaration,
   FunctionBlockDeclaration,
+  InterfaceDeclaration,
   ProgramDeclaration,
   TypeDeclaration,
   VarDeclaration,
@@ -326,6 +327,13 @@ export class SymbolTables {
   /** Bare names exported by more than one library. Keys are uppercase. */
   private ambiguousNames: Map<string, AmbiguousLibrarySite[]> = new Map();
 
+  /**
+   * Interface contracts loaded from libraries, bare and `Namespace.Name`.
+   * The analyzer merges these into the IMPLEMENTS check. Empty when no
+   * loaded library exported interfaces.
+   */
+  private libraryInterfaceDecls: InterfaceDeclaration[] = [];
+
   constructor() {
     this.globalScope = new Scope("global");
     this.initializeBuiltinTypes();
@@ -351,6 +359,15 @@ export class SymbolTables {
       if (!seen) next.push(site);
     }
     this.ambiguousNames.set(key, next);
+  }
+
+  /** Interface declarations reconstructed from loaded library manifests. */
+  addLibraryInterface(decl: InterfaceDeclaration): void {
+    this.libraryInterfaceDecls.push(decl);
+  }
+
+  libraryInterfaces(): readonly InterfaceDeclaration[] {
+    return this.libraryInterfaceDecls;
   }
 
   /** True when an unqualified `name` collides across libraries. */

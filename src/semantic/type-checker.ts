@@ -27,6 +27,7 @@ import type {
   StructType,
   CompilationUnit,
   FunctionBlockDeclaration,
+  InterfaceDeclaration,
   VarBlockType,
   FunctionDeclaration,
   Statement,
@@ -311,7 +312,11 @@ export class TypeChecker {
   ): string | undefined {
     const upper = ifaceTypeName.toUpperCase();
     if (!this.isInterfaceTypeName(upper)) return undefined;
-    const prop = findInterfaceProperty(this.ast, upper, fieldName);
+    const prop = findInterfaceProperty(
+      this.interfaceLookupAst(),
+      upper,
+      fieldName,
+    );
     if (!prop) return undefined;
     // Direction from the interface text: no accessors = read-write (both
     // sides legal); a lone GET = read-only; a lone SET = write-only.
@@ -1077,8 +1082,11 @@ export class TypeChecker {
       return this.ast?.functionBlocks.includes(owner) !== true;
     }
     return (
+      this.symbolTables
+        .libraryInterfaces()
+        .some((i) => i.methods.includes(method)) ||
       this.ast?.interfaces.find((i) => i.methods.includes(method))?.library !==
-      undefined
+        undefined
     );
   }
 
@@ -1096,12 +1104,17 @@ export class TypeChecker {
     }
     const pending = [typeName.toUpperCase()];
     const seen = new Set<string>();
+    const ifaceByName = new Map<string, InterfaceDeclaration>();
+    for (const iface of this.symbolTables.libraryInterfaces()) {
+      ifaceByName.set(iface.name.toUpperCase(), iface);
+    }
+    for (const iface of this.ast?.interfaces ?? []) {
+      ifaceByName.set(iface.name.toUpperCase(), iface);
+    }
     for (let name = pending.pop(); name; name = pending.pop()) {
       if (seen.has(name)) continue;
       seen.add(name);
-      const iface = this.ast?.interfaces.find(
-        (i) => i.name.toUpperCase() === name,
-      );
+      const iface = ifaceByName.get(name);
       const method = iface?.methods.find(named);
       if (method) return method;
       for (const e of iface?.extends ?? []) pending.push(e.toUpperCase());
@@ -1811,6 +1824,9 @@ export class TypeChecker {
     }
     const source = this.namedTypeOf(valueType);
     if (!source) return null;
+    if (this.isInterfaceName(source) || this.isInterfaceTypeName(source)) {
+      return this.interfaceRefExtends(source, target) ? undefined : source;
+    }
     return this.implementedInterfaces(source).has(target) ? undefined : source;
   }
 
@@ -1910,15 +1926,102 @@ export class TypeChecker {
   private getInterfaceTypeName(type: IECType | undefined): string | undefined {
     if (!type || type.typeKind !== "elementary") return undefined;
     const name = (type as ElementaryType).name.toUpperCase();
-    return this.ast?.interfaces.some((i) => i.name.toUpperCase() === name)
-      ? name
-      : undefined;
+    return this.isInterfaceTypeName(name) ? name : undefined;
+  }
+
+  /** Local interfaces, then library contracts. `find` prefers the first. */
+  private interfaceLookupAst(): {
+    interfaces: Array<{
+      name: string;
+      extends?: string[];
+      properties: Array<{
+        name: string;
+        type: { name: string };
+        getter?: unknown;
+        setter?: unknown;
+      }>;
+    }>;
+  } {
+    return {
+      interfaces: [
+        ...(this.ast?.interfaces ?? []),
+        ...this.symbolTables.libraryInterfaces(),
+      ],
+    };
+  }
+
+  /** Local function blocks plus every interface the IMPLEMENTS check can see. */
+  private implementsSlice(): {
+    functionBlocks: Array<{
+      name: string;
+      extends?: string;
+      implements?: string[];
+    }>;
+    interfaces: Array<{ name: string; extends?: string[] }>;
+  } {
+    return {
+      functionBlocks: this.ast?.functionBlocks ?? [],
+      interfaces: this.interfaceLookupAst().interfaces,
+    };
+  }
+
+  /**
+   * `NS.Name` and `Name` name one interface when the loaded contract has
+   * the qualified declaration. Used so a derived interface still assigns
+   * to its parent after the library boundary.
+   */
+  private interfaceRefExtends(valueName: string, targetName: string): boolean {
+    const slice = this.implementsSlice();
+    if (interfaceExtends(slice, valueName, targetName)) return true;
+    const parts = (name: string): { ns: string; leaf: string } => {
+      const dot = name.lastIndexOf(".");
+      return dot < 0
+        ? { ns: "", leaf: name }
+        : { ns: name.slice(0, dot), leaf: name.slice(dot + 1) };
+    };
+    const value = parts(valueName);
+    const target = parts(targetName);
+    // A.FOO and B.FOO are different types. Both qualified in one namespace
+    // already failed the exact walk; a same-namespace mismatch stays an error.
+    if (value.ns !== "" && target.ns !== "") return false;
+    if (value.ns === "" && target.ns === "") return false;
+    const familyNs = value.ns !== "" ? value.ns : target.ns;
+    if (
+      !this.bareNameIsFamily(value.leaf, familyNs) ||
+      !this.bareNameIsFamily(target.leaf, familyNs)
+    ) {
+      return false;
+    }
+    return interfaceExtends(slice, value.leaf, target.leaf);
+  }
+
+  /**
+   * Bare `leaf` is this namespace's unqualified contract. Another bare
+   * declaration (this program, or a second library) is a clash.
+   */
+  private bareNameIsFamily(leaf: string, ns: string): boolean {
+    const leafUpper = leaf.toUpperCase();
+    const qualifiedUpper = `${ns}.${leaf}`.toUpperCase();
+    const decls = [
+      ...(this.ast?.interfaces ?? []),
+      ...this.symbolTables.libraryInterfaces(),
+    ];
+    const qualified = decls.find(
+      (iface) => iface.name.toUpperCase() === qualifiedUpper,
+    );
+    if (!qualified) return false;
+    const libs = new Set(
+      decls
+        .filter((iface) => iface.name.toUpperCase() === leafUpper)
+        .map((iface) => iface.library ?? ""),
+    );
+    const owner = qualified.library ?? "";
+    return libs.size === 1 && libs.has(owner);
   }
 
   private isInterfaceTypeName(nameUpper: string): boolean {
-    return (
-      this.ast?.interfaces.some((i) => i.name.toUpperCase() === nameUpper) ===
-      true
+    return this.interfaceLookupAst().interfaces.some(
+      (iface) => iface.name.toUpperCase() === nameUpper,
     );
   }
 
@@ -2049,7 +2152,7 @@ export class TypeChecker {
     const valueName = (valueType as ElementaryType).name.toUpperCase();
 
     if (this.isInterfaceTypeName(valueName)) {
-      if (this.ast && interfaceExtends(this.ast, valueName, targetIfaceName)) {
+      if (this.interfaceRefExtends(valueName, targetIfaceName)) {
         return; // same interface or a descendant — reference copy
       }
       this.addError(
@@ -2064,10 +2167,22 @@ export class TypeChecker {
     if (this.isFunctionBlockTypeName(valueName)) {
       // No declaration in this unit: a library function block. bind()'s
       // template constraint is the check; do not report "does not implement".
-      const implemented = this.ast
-        ? collectImplementedInterfaces(this.ast, valueName)
-        : undefined;
-      if (implemented === undefined || implemented.has(targetIfaceName)) {
+      const implemented = collectImplementedInterfaces(
+        this.implementsSlice(),
+        valueName,
+      );
+      const targetLeaf = targetIfaceName.includes(".")
+        ? targetIfaceName.slice(targetIfaceName.lastIndexOf(".") + 1)
+        : targetIfaceName;
+      const targetKnown =
+        implemented !== undefined &&
+        (implemented.has(targetIfaceName) ||
+          (targetLeaf !== targetIfaceName &&
+            implemented.has(targetLeaf) &&
+            this.symbolTables
+              .libraryInterfaces()
+              .some((iface) => iface.name.toUpperCase() === targetIfaceName)));
+      if (implemented === undefined || targetKnown) {
         return;
       }
       this.addError(

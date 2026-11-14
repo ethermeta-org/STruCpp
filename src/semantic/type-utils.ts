@@ -271,9 +271,13 @@ export function collectImplementedInterfaces(
   if (!fbsByUpper.has(start)) return undefined;
 
   const implemented = new Set<string>();
-  const ifacesByUpper = new Map(
-    ast.interfaces.map((iface) => [iface.name.toUpperCase(), iface]),
-  );
+  // First declaration wins, so a caller can put the local AST ahead of
+  // library contracts that reuse a name.
+  const ifacesByUpper = new Map<string, (typeof ast.interfaces)[number]>();
+  for (const iface of ast.interfaces) {
+    const key = iface.name.toUpperCase();
+    if (!ifacesByUpper.has(key)) ifacesByUpper.set(key, iface);
+  }
 
   // Expand one interface through its EXTENDS chain.
   const expandInterface = (ifaceName: string) => {

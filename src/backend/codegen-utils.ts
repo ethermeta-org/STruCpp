@@ -7,6 +7,27 @@
 import { exactIntegerLiteralValue } from "../literal-utils.js";
 
 /**
+ * C++ nested namespace for a user library, or undefined when the archive
+ * stays flat inside `namespace strucpp` (iec-standard-fb and other builtins).
+ */
+export function emittedCppNamespace(
+  ns: string | undefined,
+): string | undefined {
+  if (!ns || ns === "strucpp") return undefined;
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(ns)) return undefined;
+  return ns;
+}
+
+/** `NS.Name` as it is written in C++. A bare name is unchanged. */
+export function cppScopedName(name: string): string {
+  const dot = name.indexOf(".");
+  if (dot <= 0) return name;
+  const ns = emittedCppNamespace(name.slice(0, dot));
+  const local = name.slice(dot + 1);
+  return ns ? `${ns}::${local}` : local;
+}
+
+/**
  * Convert an IEC 61131-3 based numeric string to a C++ literal string.
  * Handles 16#FF → 0xFF, 8#77 → 077, 2#1010 → 0b1010, and plain decimals.
  * Strips IEC underscore separators.

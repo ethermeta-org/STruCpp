@@ -36,6 +36,7 @@ import type {
   VarBlock,
   Visibility,
 } from "../frontend/ast.js";
+import type { FunctionBlockSymbol } from "../semantic/symbol-table.js";
 import {
   claimInstructionId,
   InstructionMapError,
@@ -56,16 +57,8 @@ import type {
   LibraryChunk,
   StlibArchive,
 } from "../library/library-manifest.js";
-
-/**
- * C++ nested namespace for a user library, or undefined when the archive
- * stays flat inside `namespace strucpp` (iec-standard-fb and other builtins).
- */
-function emittedCppNamespace(ns: string | undefined): string | undefined {
-  if (!ns || ns === "strucpp") return undefined;
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(ns)) return undefined;
-  return ns;
-}
+import { LIBRARY_CHUNK_KIND_INTERFACE } from "../library/library-manifest.js";
+import { libraryInterfaceDeclarations } from "../library/library-loader.js";
 
 function libraryCppNamespace(archive: StlibArchive): string | undefined {
   if (archive.manifest.name === "iec-standard-fb") return undefined;
@@ -94,6 +87,8 @@ import { lineageMembers } from "../ast-utils.js";
 import { wrapReferenceChain } from "./reference-types.js";
 import { TypeCodeGenerator, IEC_TO_CPP_VAR_TYPE } from "./type-codegen.js";
 import {
+  cppScopedName,
+  emittedCppNamespace,
   formatArrayType,
   formatIntegerLiteral,
   iecBaseToCppLiteral,
@@ -583,6 +578,9 @@ export class CodeGenerator {
   /** Map of UPPER(typeName).UPPER(propName) → declared property name for property access codegen */
   protected propertyNameMap: Map<string, string> = new Map();
 
+  /** Interface contracts from libraries, bare and `Namespace.Name`. */
+  private libraryInterfaceDecls: InterfaceDeclaration[] = [];
+
   /** Current FB name (set during generateFBImplementation for property resolution) */
   private currentFBName: string | undefined;
 
@@ -677,7 +675,7 @@ export class CodeGenerator {
       const ndims = vlaMatch[1];
       const elemName = vlaMatch[2]!;
       const elemType = this.isInterfaceType(elemName)
-        ? `IEC_ITF<${elemName}>`
+        ? `IEC_ITF<${cppScopedName(elemName)}>`
         : this.mapVarTypeToCpp(elemName);
       return `ArrayView${ndims}D<${elemType}>`;
     }
@@ -828,7 +826,7 @@ export class CodeGenerator {
     maxLength?: number | string,
   ): string {
     const inner = this.isInterfaceType(elementTypeName)
-      ? `IEC_ITF<${elementTypeName}>`
+      ? `IEC_ITF<${cppScopedName(elementTypeName)}>`
       : this.rawReferencedType(elementTypeName);
     if (referenceChain) {
       return wrapReferenceChain(referenceChain, inner);
@@ -845,7 +843,9 @@ export class CodeGenerator {
 
   protected mapTypeRefToCpp(typeRef: TypeShape): string {
     const interfaceRef = (typeName: string): string | undefined =>
-      this.isInterfaceType(typeName) ? `IEC_ITF<${typeName}>` : undefined;
+      this.isInterfaceType(typeName)
+        ? `IEC_ITF<${cppScopedName(typeName)}>`
+        : undefined;
 
     let baseType: string;
 
@@ -866,7 +866,7 @@ export class CodeGenerator {
     ) {
       const [, ndims, elem] = VLA_TYPE_NAME.exec(typeRef.name)!;
       const raw = this.isInterfaceType(elem!)
-        ? `IEC_ITF<${elem}>`
+        ? `IEC_ITF<${cppScopedName(elem!)}>`
         : this.rawReferencedType(elem!);
       const elemCpp = wrapReferenceChain(typeRef.elementReferenceChain, raw);
       baseType = `ArrayView${ndims}D<${elemCpp}>`;
@@ -875,7 +875,7 @@ export class CodeGenerator {
         typeRef.referenceKind === "none") &&
       this.isInterfaceType(typeRef.name)
     ) {
-      return `IEC_ITF<${typeRef.name}>`;
+      return `IEC_ITF<${cppScopedName(typeRef.name)}>`;
     } else {
       baseType =
         interfaceRef(typeRef.name) ??
@@ -1062,6 +1062,58 @@ export class CodeGenerator {
         this.registerLibraryTypes(archive.manifest.types, ns);
       }
     }
+    this.registerLibraryInterfaceMetadata(archives);
+  }
+
+  /**
+   * Library interfaces are not in the consumer AST. Register the names,
+   * methods, and properties — including those inherited through EXTENDS —
+   * so a variable, an IMPLEMENTS clause, and a property access resolve.
+   */
+  private registerLibraryInterfaceMetadata(archives: StlibArchive[]): void {
+    const decls = archives.flatMap((archive) =>
+      libraryInterfaceDeclarations(archive.manifest),
+    );
+    this.libraryInterfaceDecls = decls;
+    const byName = new Map(
+      decls.map((decl) => [decl.name.toUpperCase(), decl]),
+    );
+    for (const decl of decls) {
+      const upper = decl.name.toUpperCase();
+      this.knownInterfaceTypes.add(upper);
+      const methodSpellings = new Map<string, string>();
+      const propSpellings = new Map<string, string>();
+      const visited = new Set<string>();
+      const queue = [upper];
+      while (queue.length > 0) {
+        const name = queue.shift()!;
+        if (visited.has(name)) continue;
+        visited.add(name);
+        const iface = byName.get(name);
+        if (!iface) continue;
+        for (const method of iface.methods) {
+          const methodUpper = method.name.toUpperCase();
+          if (!methodSpellings.has(methodUpper)) {
+            methodSpellings.set(methodUpper, method.name);
+          }
+        }
+        for (const prop of iface.properties) {
+          const propUpper = prop.name.toUpperCase();
+          if (!propSpellings.has(propUpper)) {
+            propSpellings.set(propUpper, prop.name);
+          }
+        }
+        for (const parent of iface.extends ?? []) {
+          queue.push(parent.toUpperCase());
+        }
+      }
+      for (const [methodUpper, spelled] of methodSpellings) {
+        this.methodNameMap.set(`${upper}.${methodUpper}`, spelled);
+      }
+      for (const [propUpper, spelled] of propSpellings) {
+        this.propertyNameMap.set(`${upper}.${propUpper}`, spelled);
+      }
+    }
   }
 
   /**
@@ -1125,7 +1177,12 @@ export class CodeGenerator {
    */
   protected emitHeaderChunkMarker(
     boundary: "begin" | "end",
-    kind: "function" | "functionBlock" | "type" | "inlineGlobal",
+    kind:
+      | "function"
+      | "functionBlock"
+      | "type"
+      | "inlineGlobal"
+      | typeof LIBRARY_CHUNK_KIND_INTERFACE,
     name: string,
   ): void {
     if (!this.options.emitChunkMarkers) return;
@@ -1135,7 +1192,12 @@ export class CodeGenerator {
   /** Emit a chunk-boundary marker in the active cpp stream. */
   protected emitCppChunkMarker(
     boundary: "begin" | "end",
-    kind: "function" | "functionBlock" | "type" | "inlineGlobal",
+    kind:
+      | "function"
+      | "functionBlock"
+      | "type"
+      | "inlineGlobal"
+      | typeof LIBRARY_CHUNK_KIND_INTERFACE,
     name: string,
   ): void {
     if (!this.options.emitChunkMarkers) return;
@@ -1456,7 +1518,12 @@ export class CodeGenerator {
       const wrapNs = libraryCppNamespace(archive);
       if (wrapNs) lines.push(`namespace ${wrapNs} {`);
       for (const chunk of chunks) {
-        if (chunk.kind === "functionBlock") lines.push(`class ${chunk.name};`);
+        if (
+          chunk.kind === "functionBlock" ||
+          chunk.kind === LIBRARY_CHUNK_KIND_INTERFACE
+        ) {
+          lines.push(`class ${chunk.name};`);
+        }
       }
       for (const chunk of chunks) lines.push(...chunk.header.split("\n"));
       if (wrapNs) {
@@ -1790,9 +1857,17 @@ export class CodeGenerator {
     // Generate interface declarations (before FBs since FBs may implement interfaces)
     for (const iface of ast.interfaces) {
       if (iface.library !== undefined) continue;
-      this.emitHeaderChunkMarker("begin", "type", iface.name);
+      this.emitHeaderChunkMarker(
+        "begin",
+        LIBRARY_CHUNK_KIND_INTERFACE,
+        iface.name,
+      );
       this.generateInterfaceHeaderDeclaration(iface);
-      this.emitHeaderChunkMarker("end", "type", iface.name);
+      this.emitHeaderChunkMarker(
+        "end",
+        LIBRARY_CHUNK_KIND_INTERFACE,
+        iface.name,
+      );
     }
 
     // Configuration VAR_GLOBALs as file-scope singletons — emitted before the
@@ -2063,13 +2138,13 @@ export class CodeGenerator {
     const bases: string[] = [];
     if (fb.extends) {
       // Function-block EXTENDS stays ordinary single inheritance.
-      bases.push(`public ${fb.extends}`);
+      bases.push(`public ${cppScopedName(fb.extends)}`);
     }
     if (fb.implements) {
       // Interface bases are virtual so I1 and I2 both EXTENDS IBase share
       // one IBase subobject. Otherwise dynamic_cast<IBase*> is ambiguous.
       for (const iface of fb.implements) {
-        bases.push(`virtual public ${iface}`);
+        bases.push(`virtual public ${cppScopedName(iface)}`);
       }
     }
     const inheritance = bases.length > 0 ? ` : ${bases.join(", ")}` : "";
@@ -2324,7 +2399,7 @@ export class CodeGenerator {
   ): void {
     const extendsClause =
       iface.extends && iface.extends.length > 0
-        ? ` : ${iface.extends.map((e) => `virtual public ${e}`).join(", ")}`
+        ? ` : ${iface.extends.map((e) => `virtual public ${cppScopedName(e)}`).join(", ")}`
         : "";
 
     this.emitHeaderLineDirective(iface.sourceSpan.startLine);
@@ -4561,7 +4636,7 @@ export class CodeGenerator {
     // Handle SUPER reference → BaseClass::member
     // Check if last field is a property → BaseClass::get_Prop()
     if (nameUpper === "SUPER" && this.currentFBExtends) {
-      let result = `${this.currentFBExtends}::`;
+      let result = `${cppScopedName(this.currentFBExtends)}::`;
       if (expr.fieldAccess.length > 0) {
         let currentType: string | undefined = this.currentFBExtends;
         for (let i = 0; i < expr.fieldAccess.length; i++) {
@@ -4695,7 +4770,7 @@ export class CodeGenerator {
           if (propName) {
             if (currentType && this.isInterfaceType(currentType)) {
               const prop = findInterfaceProperty(
-                this.ast,
+                this.interfacePropertyAst(),
                 currentType,
                 propName,
               );
@@ -4772,7 +4847,7 @@ export class CodeGenerator {
             if (propName) {
               if (currentType && this.isInterfaceType(currentType)) {
                 const prop = findInterfaceProperty(
-                  this.ast,
+                  this.interfacePropertyAst(),
                   currentType,
                   propName,
                 );
@@ -5588,7 +5663,7 @@ export class CodeGenerator {
       if (prefix.toUpperCase() === "THIS") {
         return `this->${resolvedMethod}(${args.join(", ")})`;
       } else if (prefix.toUpperCase() === "SUPER" && this.currentFBExtends) {
-        return `${this.currentFBExtends}::${resolvedMethod}(${args.join(", ")})`;
+        return `${cppScopedName(this.currentFBExtends)}::${resolvedMethod}(${args.join(", ")})`;
       } else {
         return `${prefix}${this.memberAccessSeparator(varType)}${resolvedMethod}(${args.join(", ")})`;
       }
@@ -5601,7 +5676,7 @@ export class CodeGenerator {
       const args = expr.arguments.map((arg) =>
         this.generateExpression(arg.value),
       );
-      return `${this.currentFBExtends}::operator()(${args.join(", ")})`;
+      return `${cppScopedName(this.currentFBExtends)}::operator()(${args.join(", ")})`;
     }
 
     const ownMethod =
@@ -5993,7 +6068,7 @@ export class CodeGenerator {
     const cppType =
       typeof type === "string"
         ? this.isInterfaceType(type)
-          ? `IEC_ITF<${type}>`
+          ? `IEC_ITF<${cppScopedName(type)}>`
           : this.mapVarTypeToCpp(type)
         : this.mapTypeRefToCpp(type);
     if (this.capturedTemps !== undefined) {
@@ -6184,11 +6259,10 @@ export class CodeGenerator {
     }
 
     const upper = propName.toUpperCase();
+    const propAst = this.interfacePropertyAst();
     for (const name of owners) {
-      const implemented = collectImplementedInterfaces(this.ast, name);
-      if (implemented === undefined) continue;
-      for (const ifaceName of implemented) {
-        const prop = findInterfaceProperty(this.ast, ifaceName, upper);
+      for (const ifaceName of this.interfacesImplementedBy(name)) {
+        const prop = findInterfaceProperty(propAst, ifaceName, upper);
         if (prop === undefined) continue;
         if (prop.setter === undefined || prop.getter !== undefined) {
           return true;
@@ -6196,6 +6270,59 @@ export class CodeGenerator {
       }
     }
     return false;
+  }
+
+  /**
+   * IMPLEMENTS of this block and of library bases that are not in the
+   * unit AST, each expanded through interface EXTENDS. Names are upper-case.
+   * A qualified library name also contributes its bare name.
+   */
+  private interfacesImplementedBy(fbName: string): Set<string> {
+    const direct = new Set<string>();
+    const add = (raw: string) => {
+      const upper = raw.toUpperCase();
+      direct.add(upper);
+      const dot = upper.lastIndexOf(".");
+      if (dot > 0) direct.add(upper.slice(dot + 1));
+    };
+    const local = this.ast
+      ? collectImplementedInterfaces(this.ast, fbName)
+      : undefined;
+    if (local) {
+      for (const name of local) add(name);
+    }
+    const seen = new Set<string>();
+    let current: string | undefined = fbName;
+    while (current && !seen.has(current)) {
+      seen.add(current);
+      const localFb = this.ast?.functionBlocks.find(
+        (fb) => fb.name.toUpperCase() === current!.toUpperCase(),
+      );
+      const lookedUp: FunctionBlockSymbol | undefined =
+        this._symbolTables?.lookupFunctionBlock(current);
+      const implementsList: string[] =
+        localFb?.implements ?? lookedUp?.declaration.implements ?? [];
+      for (const iface of implementsList) add(iface);
+      const next: string | undefined =
+        localFb?.extends ?? lookedUp?.declaration.extends;
+      current = next;
+    }
+    const expanded = new Set<string>();
+    const queue = [...direct];
+    const ifaces = this.interfacePropertyAst().interfaces;
+    while (queue.length > 0) {
+      const name = queue.pop()!;
+      if (expanded.has(name)) continue;
+      expanded.add(name);
+      const iface = ifaces.find((item) => item.name.toUpperCase() === name);
+      for (const parent of iface?.extends ?? []) add(parent);
+      for (const parent of iface?.extends ?? []) {
+        queue.push(parent.toUpperCase());
+        const dot = parent.lastIndexOf(".");
+        if (dot > 0) queue.push(parent.slice(dot + 1).toUpperCase());
+      }
+    }
+    return expanded;
   }
 
   /**
@@ -6315,14 +6442,28 @@ export class CodeGenerator {
    * Find a method on an interface, walking the interface's EXTENDS chain —
    * a derived interface's method may be declared on its parent.
    */
+  private interfacePropertyAst(): {
+    interfaces: InterfaceDeclaration[];
+  } {
+    return {
+      interfaces: [
+        ...(this.ast?.interfaces ?? []),
+        ...this.libraryInterfaceDecls,
+      ],
+    };
+  }
+
   private findInterfaceMethod(
     ifaceTypeName: string,
     methodName: string,
   ): MethodDeclaration | undefined {
-    if (!this.ast) return undefined;
-    const byUpper = new Map(
-      this.ast.interfaces.map((i) => [i.name.toUpperCase(), i]),
-    );
+    const byUpper = new Map<string, InterfaceDeclaration>();
+    for (const iface of this.libraryInterfaceDecls) {
+      byUpper.set(iface.name.toUpperCase(), iface);
+    }
+    for (const iface of this.ast?.interfaces ?? []) {
+      byUpper.set(iface.name.toUpperCase(), iface);
+    }
     const visited = new Set<string>();
     const queue = [ifaceTypeName.toUpperCase()];
     while (queue.length > 0) {
@@ -6352,7 +6493,9 @@ export class CodeGenerator {
     if (elementary !== "") {
       return `${this.mapVarTypeToCpp(typeName)}(${elementary})`;
     }
-    if (this.isInterfaceType(typeName)) return `IEC_ITF<${typeName}>()`;
+    if (this.isInterfaceType(typeName)) {
+      return `IEC_ITF<${cppScopedName(typeName)}>()`;
+    }
     // User composites (struct/FB/enum) are default-constructible.
     return `${this.mapVarTypeToCpp(typeName)}()`;
   }
@@ -6420,11 +6563,12 @@ export class CodeGenerator {
       : `(&${srcCode})`;
     const destCode = this.generateExpression(dest);
     const tmp = `__queryinterface_${this.tempVarCounter++}`;
+    const destCpp = cppScopedName(destTypeName);
     // Immediately-invoked lambda, same shape as with_lock: the cast and
     // bind run when the expression is evaluated, so a WHILE condition
     // queries every iteration and a CASE arm does not declare a pointer
     // in the switch scope.
-    return `([&]() { ${destTypeName}* ${tmp} = dynamic_cast<${destTypeName}*>(${srcPtr}); ${destCode}.bind(${tmp}); return ${tmp} != nullptr; }())`;
+    return `([&]() { ${destCpp}* ${tmp} = dynamic_cast<${destCpp}*>(${srcPtr}); ${destCode}.bind(${tmp}); return ${tmp} != nullptr; }())`;
   }
 
   /** Parentheses do not stop an operand from being a variable. */
@@ -6524,7 +6668,11 @@ export class CodeGenerator {
   ): string | undefined {
     if (!typeName) return undefined;
     if (this.isInterfaceType(typeName)) {
-      const prop = findInterfaceProperty(this.ast, typeName, memberName);
+      const prop = findInterfaceProperty(
+        this.interfacePropertyAst(),
+        typeName,
+        memberName,
+      );
       if (prop) return prop.type.name;
     }
     if (this.ast) {
@@ -6577,7 +6725,11 @@ export class CodeGenerator {
     // pointer; an unbound reference ignores the write instead of crashing.
     // Read-only properties never get here — the analyzer rejects the write.
     if (this.isInterfaceType(currentType)) {
-      const prop = findInterfaceProperty(this.ast, currentType, propName);
+      const prop = findInterfaceProperty(
+        this.interfacePropertyAst(),
+        currentType,
+        propName,
+      );
       // Write direction: a SET accessor, or no accessors at all (the
       // read-write default).
       if (!prop || (prop.setter === undefined && prop.getter !== undefined)) {
@@ -6614,7 +6766,7 @@ export class CodeGenerator {
         ct = ft;
       }
     } else if (nameUpper === "SUPER" && this.currentFBExtends) {
-      objectCode = this.currentFBExtends + "::";
+      objectCode = `${cppScopedName(this.currentFBExtends)}::`;
       let ct: string | undefined = this.currentFBExtends;
       for (let i = 0; i < expr.fieldAccess.length - 1; i++) {
         const f = expr.fieldAccess[i]!;
