@@ -366,7 +366,9 @@ export class TypeCodeGenerator {
       }
       const rawType = field.type.arrayDimensions
         ? cppType
-        : this.mapTypeToCpp(field.type.name);
+        : this.options.isInterfaceType(field.type.name)
+          ? `IEC_ITF<${field.type.name}>`
+          : this.mapTypeToCpp(field.type.name);
       cppType = isReferenceField(field.type)
         ? // REF_TO / REFERENCE TO: the same wrapper a variable gets.
           wrapReferenceChain(
@@ -558,7 +560,11 @@ export class TypeCodeGenerator {
     } else {
       cppType = this.mapTypeToCpp(def.name);
     }
-    const rawType = def.arrayDimensions ? cppType : this.mapTypeToCpp(def.name);
+    const rawType = def.arrayDimensions
+      ? cppType
+      : this.options.isInterfaceType(def.name)
+        ? `IEC_ITF<${def.name}>`
+        : this.mapTypeToCpp(def.name);
     cppType = isReferenceField(def)
       ? wrapReferenceChain(def.referenceChain ?? [def.referenceKind], rawType)
       : rawPointerType(def, cppType, rawType);
