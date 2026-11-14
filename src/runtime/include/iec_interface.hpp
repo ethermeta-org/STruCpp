@@ -82,6 +82,78 @@ public:
         ptr_ = instance;
     }
 
+    /**
+     * Rebind from another interface reference. A child interface converts
+     * to a parent (`s := items[i]` when the element extends `s`'s type).
+     * Same-type copies the pointer. __QUERYINTERFACE calls bind again, so
+     * a later success replaces the previous instance.
+     */
+    template <typename U,
+              typename = typename std::enable_if<
+                  std::is_base_of<T, U>::value>::type>
+    void bind(const IEC_ITF<U>& other) {
+        ptr_ = other.get();
+    }
+
+    /** `itf := 0` unbinds. A non-zero integer is not a reference. */
+    template <typename N,
+              typename = typename std::enable_if<
+                  std::is_integral<N>::value>::type>
+    void bind(N value) {
+        if (value == 0) ptr_ = nullptr;
+    }
+
+    /**
+     * Assign a related interface reference. The copy assignment stays the
+     * non-template one; this is only the upcast (`I := J` when J extends I).
+     */
+    template <typename U,
+              typename = typename std::enable_if<
+                  std::is_base_of<T, U>::value &&
+                  !std::is_same<T, U>::value>::type>
+    IEC_ITF& operator=(const IEC_ITF<U>& other) noexcept {
+        ptr_ = other.get();
+        return *this;
+    }
+
+    template <typename N,
+              typename = typename std::enable_if<
+                  std::is_integral<N>::value>::type>
+    IEC_ITF& operator=(N value) noexcept {
+        if (value == 0) ptr_ = nullptr;
+        return *this;
+    }
+
+    /** Same instance, including a child interface compared with its parent. */
+    template <typename U,
+              typename = typename std::enable_if<
+                  std::is_base_of<T, U>::value ||
+                  std::is_base_of<U, T>::value>::type>
+    bool operator==(const IEC_ITF<U>& other) const noexcept {
+        return ptr_ == other.get();
+    }
+    template <typename U,
+              typename = typename std::enable_if<
+                  std::is_base_of<T, U>::value ||
+                  std::is_base_of<U, T>::value>::type>
+    bool operator!=(const IEC_ITF<U>& other) const noexcept {
+        return !(*this == other);
+    }
+
+    /** `itf = 0` / `itf <> 0`. Only zero means unbound. */
+    template <typename N,
+              typename = typename std::enable_if<
+                  std::is_integral<N>::value>::type>
+    bool operator==(N value) const noexcept {
+        return value == 0 ? ptr_ == nullptr : false;
+    }
+    template <typename N,
+              typename = typename std::enable_if<
+                  std::is_integral<N>::value>::type>
+    bool operator!=(N value) const noexcept {
+        return !(*this == value);
+    }
+
     /** Raw interface pointer; nullptr when unbound. */
     T* get() const { return ptr_; }
 
@@ -96,5 +168,17 @@ public:
 private:
     T* ptr_;
 };
+
+/** `0 = itf` and `0 <> itf`: comparison with zero on the left. */
+template <typename N, typename T,
+          typename = typename std::enable_if<std::is_integral<N>::value>::type>
+bool operator==(N value, const IEC_ITF<T>& itf) noexcept {
+    return itf == value;
+}
+template <typename N, typename T,
+          typename = typename std::enable_if<std::is_integral<N>::value>::type>
+bool operator!=(N value, const IEC_ITF<T>& itf) noexcept {
+    return itf != value;
+}
 
 }  // namespace strucpp
