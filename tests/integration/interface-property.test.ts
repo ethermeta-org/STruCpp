@@ -450,6 +450,37 @@ END_FUNCTION_BLOCK
     expect(message).toContain("SPEED");
   });
 
+  it("rejects a read-only property through a member chain and still reports IMPLEMENTS", () => {
+    const result = compile(`
+INTERFACE I
+    PROPERTY RO : INT
+        GET
+        END_GET
+    END_PROPERTY
+END_INTERFACE
+FUNCTION_BLOCK NoSet IMPLEMENTS I
+END_FUNCTION_BLOCK
+FUNCTION_BLOCK Host
+VAR
+    itf : I;
+END_VAR
+END_FUNCTION_BLOCK
+PROGRAM Main
+VAR
+    host : Host;
+END_VAR
+    host.itf.RO := 5;
+END_PROGRAM
+`);
+    const errors = result.errors.map((e) => e.message);
+    expect(errors).toContain(
+      "Property 'RO' of 'I' is read-only (no SET accessor).",
+    );
+    expect(errors).toContain(
+      "FUNCTION_BLOCK 'NOSET' implements 'I' but does not provide PROPERTY 'RO'.",
+    );
+  });
+
   it("rejects reading a write-only property through a reference", () => {
     const result = compile(`
 INTERFACE IWrite

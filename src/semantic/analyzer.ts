@@ -2547,34 +2547,40 @@ export class SemanticAnalyzer {
     const checkStatementsInScope = (
       stmts: Statement[],
       varTypeMap: Map<string, string>,
+      unit: CompilationUnit,
     ) => {
-      this.walkStatementsForPropertyWrites(stmts, varTypeMap, propertyInfo);
+      this.walkStatementsForPropertyWrites(
+        stmts,
+        varTypeMap,
+        propertyInfo,
+        unit,
+      );
     };
 
     // Check programs
     for (const prog of ast.programs) {
       const varTypeMap = this.buildVarTypeMap(prog.varBlocks);
-      checkStatementsInScope(prog.body, varTypeMap);
+      checkStatementsInScope(prog.body, varTypeMap, ast);
     }
 
     // Check function blocks (body and method bodies)
     for (const fb of ast.functionBlocks) {
       const varTypeMap = this.buildVarTypeMap(fb.varBlocks);
-      checkStatementsInScope(fb.body, varTypeMap);
+      checkStatementsInScope(fb.body, varTypeMap, ast);
       for (const method of fb.methods) {
         const methodVarMap = new Map(varTypeMap);
         // Add method-local vars
         for (const [k, v] of this.buildVarTypeMap(method.varBlocks)) {
           methodVarMap.set(k, v);
         }
-        checkStatementsInScope(method.body, methodVarMap);
+        checkStatementsInScope(method.body, methodVarMap, ast);
       }
     }
 
     // Check functions
     for (const func of ast.functions) {
       const varTypeMap = this.buildVarTypeMap(func.varBlocks);
-      checkStatementsInScope(func.body, varTypeMap);
+      checkStatementsInScope(func.body, varTypeMap, ast);
     }
   }
 
@@ -2594,29 +2600,80 @@ export class SemanticAnalyzer {
   }
 
   /**
-   * Walk statements looking for assignments to read-only properties.
+   * The type that owns the last field of `host.itf.RO`. Intermediate fields
+   * are struct, function-block, or interface-property steps. Undefined when
+   * the chain cannot be resolved, including a trailing bit access.
    */
+  private propertyWriteOwner(
+    target: VariableExpression,
+    varTypeMap: Map<string, string>,
+    ast: CompilationUnit,
+  ): { owner: string; field: string } | undefined {
+    const field = target.fieldAccess[target.fieldAccess.length - 1];
+    if (field === undefined || /^\d+$/.test(field)) return undefined;
+    const start = varTypeMap.get(target.name.toUpperCase());
+    if (start === undefined) return undefined;
+    let owner = start;
+    for (let i = 0; i < target.fieldAccess.length - 1; i++) {
+      const step = target.fieldAccess[i]!;
+      if (/^\d+$/.test(step)) return undefined;
+      const next =
+        resolveFieldType(owner, step, ast) ??
+        this.interfacePropertyType(ast, owner, step);
+      if (next === undefined) return undefined;
+      owner = next.toUpperCase();
+    }
+    return { owner, field };
+  }
+
+  /** Declared type of an interface property, including properties inherited through EXTENDS. */
+  private interfacePropertyType(
+    ast: CompilationUnit,
+    typeName: string,
+    fieldName: string,
+  ): string | undefined {
+    const upper = fieldName.toUpperCase();
+    const ifaces = new Map(
+      ast.interfaces.map((iface) => [iface.name.toUpperCase(), iface]),
+    );
+    const pending = [typeName.toUpperCase()];
+    const seen = new Set<string>();
+    for (let name = pending.pop(); name !== undefined; name = pending.pop()) {
+      if (seen.has(name)) continue;
+      seen.add(name);
+      const iface = ifaces.get(name);
+      if (iface === undefined) continue;
+      const prop = iface.properties.find((p) => p.name.toUpperCase() === upper);
+      if (prop) return prop.type.name;
+      pending.push(
+        ...(iface.extends ?? []).map((parent) => parent.toUpperCase()),
+      );
+    }
+    return undefined;
+  }
+
   private walkStatementsForPropertyWrites(
     stmts: Statement[],
     varTypeMap: Map<string, string>,
     propertyInfo: Map<string, { hasSetter: boolean }>,
+    ast: CompilationUnit,
   ): void {
     for (const stmt of stmts) {
       if (stmt.kind === "AssignmentStatement") {
         const target = stmt.target;
-        // Check for x.Property := value pattern
+        // `itf.RO := 5` and `host.itf.RO := 5`. Reported here, after
+        // IMPLEMENTS, so a type-checker error cannot skip that pass.
         if (
           target.kind === "VariableExpression" &&
-          target.fieldAccess.length === 1
+          target.fieldAccess.length >= 1
         ) {
-          const varType = varTypeMap.get(target.name.toUpperCase());
-          if (varType) {
-            const fieldName = target.fieldAccess[0]!;
-            const propKey = `${varType}.${fieldName.toUpperCase()}`;
+          const located = this.propertyWriteOwner(target, varTypeMap, ast);
+          if (located) {
+            const propKey = `${located.owner}.${located.field.toUpperCase()}`;
             const info = propertyInfo.get(propKey);
             if (info && !info.hasSetter) {
               this.addError(
-                `Property '${fieldName}' of '${varType}' is read-only (no SET accessor).`,
+                `Property '${located.field}' of '${located.owner}' is read-only (no SET accessor).`,
                 stmt.sourceSpan.startLine,
                 stmt.sourceSpan.startCol,
                 stmt.sourceSpan.file,
@@ -2626,7 +2683,12 @@ export class SemanticAnalyzer {
         }
       }
       // Recurse into control flow
-      this.recurseStatementsForPropertyWrites(stmt, varTypeMap, propertyInfo);
+      this.recurseStatementsForPropertyWrites(
+        stmt,
+        varTypeMap,
+        propertyInfo,
+        ast,
+      );
     }
   }
 
@@ -2637,6 +2699,7 @@ export class SemanticAnalyzer {
     stmt: Statement,
     varTypeMap: Map<string, string>,
     propertyInfo: Map<string, { hasSetter: boolean }>,
+    ast: CompilationUnit,
   ): void {
     if (stmt.kind === "IfStatement") {
       const s = stmt as unknown as {
@@ -2648,28 +2711,46 @@ export class SemanticAnalyzer {
         s.thenStatements,
         varTypeMap,
         propertyInfo,
+        ast,
       );
       for (const clause of s.elsifClauses) {
         this.walkStatementsForPropertyWrites(
           clause.statements,
           varTypeMap,
           propertyInfo,
+          ast,
         );
       }
       this.walkStatementsForPropertyWrites(
         s.elseStatements,
         varTypeMap,
         propertyInfo,
+        ast,
       );
     } else if (stmt.kind === "ForStatement") {
       const s = stmt as unknown as { body: Statement[] };
-      this.walkStatementsForPropertyWrites(s.body, varTypeMap, propertyInfo);
+      this.walkStatementsForPropertyWrites(
+        s.body,
+        varTypeMap,
+        propertyInfo,
+        ast,
+      );
     } else if (stmt.kind === "WhileStatement") {
       const s = stmt as unknown as { body: Statement[] };
-      this.walkStatementsForPropertyWrites(s.body, varTypeMap, propertyInfo);
+      this.walkStatementsForPropertyWrites(
+        s.body,
+        varTypeMap,
+        propertyInfo,
+        ast,
+      );
     } else if (stmt.kind === "RepeatStatement") {
       const s = stmt as unknown as { body: Statement[] };
-      this.walkStatementsForPropertyWrites(s.body, varTypeMap, propertyInfo);
+      this.walkStatementsForPropertyWrites(
+        s.body,
+        varTypeMap,
+        propertyInfo,
+        ast,
+      );
     } else if (stmt.kind === "CaseStatement") {
       const s = stmt as unknown as {
         cases: Array<{ statements: Statement[] }>;
@@ -2680,12 +2761,14 @@ export class SemanticAnalyzer {
           c.statements,
           varTypeMap,
           propertyInfo,
+          ast,
         );
       }
       this.walkStatementsForPropertyWrites(
         s.elseStatements,
         varTypeMap,
         propertyInfo,
+        ast,
       );
     }
   }
