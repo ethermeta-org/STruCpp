@@ -315,16 +315,9 @@ export class TypeChecker {
     if (!prop) return undefined;
     // Direction from the interface text: no accessors = read-write (both
     // sides legal); a lone GET = read-only; a lone SET = write-only.
-    const isReadOnly = prop.getter !== undefined && prop.setter === undefined;
     const isWriteOnly = prop.setter !== undefined && prop.getter === undefined;
-    if (writing && isReadOnly) {
-      this.addError(
-        `Cannot assign to read-only property '${prop.name}' of interface '${upper}': the interface declares no SET accessor.`,
-        span.startLine,
-        span.startCol,
-        span.file,
-      );
-    }
+    // A direct `itf.Prop :=` write of a read-only property is reported by
+    // validatePropertyAccess. Reporting it here would skip that pass.
     if (!writing && isWriteOnly) {
       this.addError(
         `Cannot read write-only property '${prop.name}' of interface '${upper}': the interface declares no GET accessor.`,
@@ -881,13 +874,16 @@ export class TypeChecker {
     }
 
     // Could be a function block invocation (treated as statement, no return).
-    // An interface-typed input uses the same rule as `itf := value`.
+    // callInputs already checked interface arguments. The remaining case is
+    // an instance call whose inputs that lookup does not see.
     const fbInstance = scope.lookup(expr.functionName);
     if (fbInstance?.kind === "variable") {
-      this.validateFbInterfaceArguments(
-        expr,
-        fbInstance.declaration?.type?.name,
-      );
+      if (!inputs) {
+        this.validateFbInterfaceArguments(
+          expr,
+          fbInstance.declaration?.type?.name,
+        );
+      }
       return undefined;
     }
 

@@ -891,13 +891,14 @@ PROGRAM Main
   VAR itf : I; END_VAR
   itf.RO := 5;
 END_PROGRAM`);
+    // NoAccessor declares neither GET nor SET: that is read-write, not an error.
     expect(errors).toEqual([
       "PROPERTY 'HIDDEN' of INTERFACE 'BAD' cannot have an access modifier.",
-      "PROPERTY 'NOACCESSOR' of INTERFACE 'BAD' must declare GET, SET or both.",
       "PROPERTY 'BODY' of INTERFACE 'BAD' cannot have a body.",
       "FUNCTION_BLOCK 'WRONGTYPE' implements 'I' but its PROPERTY 'P' is DINT, not INT.",
       "FUNCTION_BLOCK 'NOSET' implements 'I' but its PROPERTY 'P' has no SET.",
       "FUNCTION_BLOCK 'NOSET' implements 'I' but does not provide PROPERTY 'RO'.",
+      "PROPERTY 'BODY' in INTERFACE 'BAD' cannot contain statements in its GET accessor; interface properties have no body.",
       "Property 'RO' of 'I' is read-only (no SET accessor).",
     ]);
   });

@@ -1807,7 +1807,7 @@ export class SemanticAnalyzer {
   }
 
   /**
-   * Interface properties: a signature lists GET, SET or both, with empty bodies and no access modifier. A non-abstract
+   * Interface properties: no accessor is read-write, a lone GET is read-only, a lone SET is write-only. Bodies are empty and there is no access modifier. A non-abstract
    * function block implementing the interface (directly, through EXTENDS of the interface, or through a base block)
    * must have, in its lineage, a property of the same name and type with every accessor the signature lists.
    */
@@ -1821,13 +1821,6 @@ export class SemanticAnalyzer {
         if (prop.visibility !== "PUBLIC")
           this.addError(
             `PROPERTY '${prop.name}' of INTERFACE '${iface.name}' cannot have an access modifier.`,
-            at.startLine,
-            at.startCol,
-            at.file,
-          );
-        if (!prop.getter && !prop.setter)
-          this.addError(
-            `PROPERTY '${prop.name}' of INTERFACE '${iface.name}' must declare GET, SET or both.`,
             at.startLine,
             at.startCol,
             at.file,
@@ -2259,7 +2252,7 @@ export class SemanticAnalyzer {
           if (requiredMethods) {
             for (const reqMethod of requiredMethods) {
               const provided = fbMethods.get(reqMethod);
-              if (!provided || provided.visibility !== "PUBLIC") {
+              if (!provided) {
                 this.addError(
                   `FUNCTION_BLOCK '${fb.name}' implements '${ifaceName}'${inherited} but does not provide method '${reqMethod}'.`,
                   fb.sourceSpan.startLine,
@@ -2268,15 +2261,12 @@ export class SemanticAnalyzer {
                 );
                 continue;
               }
-              const impl =
-                fb.methods.find((m) => m.name.toUpperCase() === reqMethod) ??
-                parentMethods.get(reqMethod);
-              if (impl !== undefined && impl.visibility !== "PUBLIC") {
+              if (provided.visibility !== "PUBLIC") {
                 this.addError(
-                  `FUNCTION_BLOCK '${fb.name}' implements '${ifaceName}' but its method '${reqMethod}' is ${impl.visibility}; interface members must be implemented PUBLIC.`,
-                  fb.sourceSpan.startLine,
-                  fb.sourceSpan.startCol,
-                  fb.sourceSpan.file,
+                  `FUNCTION_BLOCK '${fb.name}' implements '${ifaceName}' but its method '${reqMethod}' is ${provided.visibility}; interface members must be implemented PUBLIC.`,
+                  provided.sourceSpan.startLine,
+                  provided.sourceSpan.startCol,
+                  provided.sourceSpan.file,
                 );
               }
             }
@@ -2291,29 +2281,46 @@ export class SemanticAnalyzer {
           if (requiredProps) {
             for (const reqProp of requiredProps.values()) {
               const provided = fbProps.get(reqProp.name.toUpperCase());
+              // An accessor on the interface text is reported by
+              // validateInterfaceProperties ("PROPERTY", "has no SET").
+              // Repeat that here only for the read-write default, whose
+              // wording names the missing accessor.
+              const declaredDirection =
+                reqProp.getter !== undefined || reqProp.setter !== undefined;
               if (!provided || provided.visibility !== "PUBLIC") {
-                this.addError(
-                  `FUNCTION_BLOCK '${fb.name}' implements '${ifaceName}'${inherited} but does not provide property '${reqProp.name}'.`,
-                  fb.sourceSpan.startLine,
-                  fb.sourceSpan.startCol,
-                  fb.sourceSpan.file,
-                );
+                if (!declaredDirection) {
+                  this.addError(
+                    `FUNCTION_BLOCK '${fb.name}' implements '${ifaceName}'${inherited} but does not provide property '${reqProp.name}'.`,
+                    fb.sourceSpan.startLine,
+                    fb.sourceSpan.startCol,
+                    fb.sourceSpan.file,
+                  );
+                }
                 continue;
               }
               if (!propertyTypesEqual(provided.type, reqProp.type)) {
-                this.addError(
-                  `FUNCTION_BLOCK '${fb.name}' implements '${ifaceName}'${inherited} but property '${reqProp.name}' has type '${formatPropertyType(provided.type)}' while the interface declares '${formatPropertyType(reqProp.type)}'.`,
-                  provided.sourceSpan.startLine,
-                  provided.sourceSpan.startCol,
-                  provided.sourceSpan.file,
-                );
+                const plainNames =
+                  formatPropertyType(provided.type) === provided.type.name &&
+                  formatPropertyType(reqProp.type) === reqProp.type.name;
+                if (!plainNames) {
+                  this.addError(
+                    `FUNCTION_BLOCK '${fb.name}' implements '${ifaceName}'${inherited} but property '${reqProp.name}' has type '${formatPropertyType(provided.type)}' while the interface declares '${formatPropertyType(reqProp.type)}'.`,
+                    provided.sourceSpan.startLine,
+                    provided.sourceSpan.startCol,
+                    provided.sourceSpan.file,
+                  );
+                }
                 continue;
               }
               const needsGet =
                 reqProp.setter === undefined || reqProp.getter !== undefined;
               const needsSet =
                 reqProp.getter === undefined || reqProp.setter !== undefined;
-              if (needsGet && provided.getter === undefined) {
+              if (
+                needsGet &&
+                provided.getter === undefined &&
+                reqProp.getter === undefined
+              ) {
                 this.addError(
                   `FUNCTION_BLOCK '${fb.name}' implements '${ifaceName}'${inherited} but property '${reqProp.name}' is missing a GET accessor.`,
                   provided.sourceSpan.startLine,
@@ -2321,7 +2328,11 @@ export class SemanticAnalyzer {
                   provided.sourceSpan.file,
                 );
               }
-              if (needsSet && provided.setter === undefined) {
+              if (
+                needsSet &&
+                provided.setter === undefined &&
+                reqProp.setter === undefined
+              ) {
                 this.addError(
                   `FUNCTION_BLOCK '${fb.name}' implements '${ifaceName}'${inherited} but property '${reqProp.name}' is missing a SET accessor.`,
                   provided.sourceSpan.startLine,
@@ -2520,8 +2531,12 @@ export class SemanticAnalyzer {
         seen.add(name);
         for (const prop of current.properties) {
           const key = `${iface.name.toUpperCase()}.${prop.name.toUpperCase()}`;
-          if (!propertyInfo.has(key))
-            propertyInfo.set(key, { hasSetter: prop.setter !== undefined });
+          if (!propertyInfo.has(key)) {
+            // No accessors is read-write. A lone GET is read-only.
+            const hasSetter =
+              prop.setter !== undefined || prop.getter === undefined;
+            propertyInfo.set(key, { hasSetter });
+          }
         }
         pending.push(...(current.extends ?? []).map((e) => e.toUpperCase()));
       }

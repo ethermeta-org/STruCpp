@@ -213,6 +213,16 @@ export class STParser extends CstParser {
     "interfacePropertyDeclaration",
     () => {
       this.CONSUME(tokens.PROPERTY);
+      // A visibility keyword is parsed so the analyzer can name the
+      // interface. An interface property is always public.
+      this.OPTION(() => {
+        this.OR3([
+          { ALT: () => this.CONSUME(tokens.PUBLIC) },
+          { ALT: () => this.CONSUME(tokens.PRIVATE) },
+          { ALT: () => this.CONSUME(tokens.PROTECTED) },
+          { ALT: () => this.CONSUME(tokens.INTERNAL) },
+        ]);
+      });
       this.CONSUME(tokens.Identifier);
       this.CONSUME(tokens.Colon);
       // Same type position as a variable: elementary/derived, or ARRAY OF.

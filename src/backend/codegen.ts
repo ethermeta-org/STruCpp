@@ -894,7 +894,8 @@ export class CodeGenerator {
       const elemType =
         typeRef.arrayDimensions && typeRef.elementTypeName
           ? baseType
-          : (interfaceRef(typeRef.name) ?? this.rawReferencedType(typeRef.name));
+          : (interfaceRef(typeRef.name) ??
+            this.rawReferencedType(typeRef.name));
       return wrapReferenceChain(
         typeRef.referenceChain ?? [typeRef.referenceKind],
         elemType,
@@ -2361,7 +2362,7 @@ export class CodeGenerator {
       const propLine = this.currentHeaderLine;
       if (needsGet) {
         this.emitHeader(
-          `    virtual ${types.value} get_${prop.name}() = 0;`,
+          `    virtual ${types.value} get_${prop.name}() const = 0;`,
         );
       }
       if (needsSet) {
@@ -2518,7 +2519,10 @@ export class CodeGenerator {
       this.emitHeaderLineDirective(prop.sourceSpan.startLine);
       const propLine = this.currentHeaderLine;
       if (prop.getter) {
-        this.emitHeader(`    virtual ${types.value} get_${prop.name}();`);
+        const cnst = this.getterNeedsConst(prop.name) ? " const" : "";
+        this.emitHeader(
+          `    virtual ${types.value} get_${prop.name}()${cnst};`,
+        );
       }
       if (prop.setter) {
         this.emitHeader(
@@ -2637,7 +2641,8 @@ export class CodeGenerator {
     if (prop.getter) {
       this.emitLineDirective(prop.sourceSpan.startLine);
       const getterLine = this.currentLine;
-      this.emit(`${types.value} ${className}::get_${prop.name}() {`);
+      const cnst = this.getterNeedsConst(prop.name) ? " const" : "";
+      this.emit(`${types.value} ${className}::get_${prop.name}()${cnst} {`);
       this.emitDebugFrameGuard(prop.getter);
       this.emit(`    ${types.value} ${prop.name}_result;`);
       this.currentFunctionName = prop.name;
@@ -6138,6 +6143,22 @@ export class CodeGenerator {
     },
   >(typeRef: T): string {
     return this.mapTypeRefToCpp(typeRef);
+  }
+
+  /**
+   * An interface getter is `const`. The function block that supplies it
+   * must use the same signature or the override does not bind. A block
+   * with no interface property of this name keeps the non-const getter.
+   */
+  private getterNeedsConst(propName: string): boolean {
+    const upper = propName.toUpperCase();
+    for (const iface of this.ast?.interfaces ?? []) {
+      for (const prop of iface.properties) {
+        if (prop.name.toUpperCase() !== upper) continue;
+        if (prop.setter === undefined || prop.getter !== undefined) return true;
+      }
+    }
+    return false;
   }
 
   /**
